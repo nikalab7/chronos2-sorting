@@ -580,10 +580,19 @@ class ZeroShotResearchPipeline:
         tail_fractions: tuple[float, ...] = (0.10, 0.15, 0.20),
         execution_interval: str = "5m",
         execution_mode: str = "strict",
+        default_borrow_fee_annual_bps: float | None = None,
+        borrow_profile_path: Path | None = None,
+        unavailable_tickers: tuple[str, ...] = (),
     ) -> None:
         labeled_frame = pd.read_csv(run_dir / "labeled_frame.csv")
         with (run_dir / experiment / "forecasts.json").open("r", encoding="utf-8") as handle:
             forecasts = pd.DataFrame(json.load(handle))
+        borrow_profile = pd.read_csv(borrow_profile_path) if borrow_profile_path is not None else None
+        borrow_fee_annual_bps = (
+            float(default_borrow_fee_annual_bps)
+            if default_borrow_fee_annual_bps is not None
+            else float(self.research_config.default_short_borrow_fee_annual_bps)
+        )
 
         signal_outputs = generate_signal_execution_analysis(
             forecasts,
@@ -597,6 +606,9 @@ class ZeroShotResearchPipeline:
             tail_fractions=tail_fractions,
             book_mode=self.research_config.default_v2_book_mode,
             tail_fraction=self.research_config.default_v2_tail_fraction,
+            default_borrow_fee_annual_bps=borrow_fee_annual_bps,
+            borrow_profile=borrow_profile,
+            unavailable_tickers=unavailable_tickers,
         )
 
         baseline_book = signal_outputs["signal_execution_baseline_book"]
@@ -641,6 +653,9 @@ class ZeroShotResearchPipeline:
                         "tail_fractions": ",".join(str(value) for value in tail_fractions),
                         "execution_interval": execution_interval,
                         "execution_mode": execution_mode,
+                        "default_borrow_fee_annual_bps": borrow_fee_annual_bps,
+                        "borrow_profile_path": str(borrow_profile_path) if borrow_profile_path is not None else "",
+                        "borrow_unavailable_tickers": ",".join(sorted(set(unavailable_tickers))),
                         "execution_mode_label": STRICT_EXECUTION_MODE_LABEL,
                         "exact_open_entry_formula": EXACT_OPEN_ENTRY_FORMULA,
                         "first_5m_avg_entry_formula": FIRST_5M_ENTRY_FORMULA,

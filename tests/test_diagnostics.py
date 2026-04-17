@@ -179,6 +179,8 @@ class DiagnosticsTests(unittest.TestCase):
             costs_bps=(10, 20, 40),
             book_mode="tail_fraction",
             tail_fraction=0.25,
+            default_borrow_fee_annual_bps=50.0,
+            unavailable_tickers=("BBB",),
         )
 
         self.assertIn("score_behavior_summary", outputs)
@@ -191,12 +193,24 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("ticker_attribution_summary", outputs)
         self.assertIn("live_scoreboard_positions", outputs)
         self.assertIn("live_scoreboard_daily", outputs)
+        self.assertIn("oos_window_summary", outputs)
+        self.assertIn("oos_concentration_summary", outputs)
+        self.assertIn("side_isolation_summary", outputs)
+        self.assertIn("borrow_overlay_summary", outputs)
+        self.assertIn("borrow_overlay_positions", outputs)
         self.assertIn("tail_fraction", outputs["tail_filter_comparison"].columns)
         self.assertIn("execution_mode", outputs["execution_sensitivity_comparison"].columns)
         self.assertIn("score_plain", outputs["live_scoreboard_positions"].columns)
         self.assertIn("score_z", outputs["live_scoreboard_positions"].columns)
         self.assertIn("book_impact", outputs["live_scoreboard_positions"].columns)
         self.assertIn("best_contributor", outputs["live_scoreboard_daily"].columns)
+        self.assertIn("target_gap_20d", outputs["oos_window_summary"].columns)
+        self.assertIn("top2_abs_pnl_share", outputs["oos_concentration_summary"].columns)
+        self.assertEqual(set(outputs["side_isolation_summary"]["side"].tolist()), {"long", "short"})
+        borrow_positions = outputs["borrow_overlay_positions"]
+        self.assertIn("borrow_excluded", borrow_positions.columns)
+        self.assertTrue(bool(borrow_positions.loc[borrow_positions["ticker"] == "BBB", "borrow_excluded"].any()))
+        self.assertGreater(int(outputs["borrow_overlay_summary"].iloc[0]["excluded_short_positions"]), 0)
 
     def test_generate_near_open_execution_analysis_uses_strict_day_drops_and_ohlc4_entries(self) -> None:
         book = pd.DataFrame(
@@ -369,6 +383,9 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(scorecard), 1)
         self.assertIn("book_hit_rate", scorecard.columns)
         self.assertIn("top_contributors", scorecard.columns)
+        self.assertIn("oos_target_gap_20d", scorecard.columns)
+        self.assertIn("borrow_overlay_net_sharpe_10bps", scorecard.columns)
+        self.assertIn("long_only_net_sharpe_10bps", scorecard.columns)
         self.assertEqual(scorecard.iloc[0]["execution_mode_label"], STRICT_EXECUTION_MODE_LABEL)
         self.assertEqual(scorecard.iloc[0]["exact_open_entry_formula"], EXACT_OPEN_ENTRY_FORMULA)
 

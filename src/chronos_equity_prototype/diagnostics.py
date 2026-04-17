@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import ceil
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1646,6 +1647,407 @@ def _format_top_tickers(ticker_attribution_summary: pd.DataFrame, *, ascending: 
     )
 
 
+def _build_oos_window_reports(
+    *,
+    forecasts: pd.DataFrame,
+    labeled_frame: pd.DataFrame,
+    live_scoreboard_daily: pd.DataFrame,
+    baseline_rank_ic: pd.DataFrame,
+    slots_per_session: int = 7,
+    target_days: tuple[int, ...] = (20, 30),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    normalized_forecasts = _normalize_time_columns(forecasts, ["signal_session", "prediction_session"])
+    normalized_labeled = _normalize_time_columns(labeled_frame, ["session_date", "timestamp"])
+    normalized_daily = _normalize_time_columns(live_scoreboard_daily, ["signal_session", "prediction_session"])
+
+    context_values = (
+        pd.to_numeric(normalized_forecasts["context_length"], errors="coerce").dropna()
+        if "context_length" in normalized_forecasts.columns
+        else pd.Series(dtype=float)
+    )
+    context_length = float(context_values.iloc[0]) if not context_values.empty else float("nan")
+    required_context_sessions = (
+        int(ceil(context_length / slots_per_session))
+        if not np.isnan(context_length)
+        else float("nan")
+    )
+    complete_sessions = (
+        int(pd.to_datetime(normalized_labeled["session_date"], utc=True, errors="coerce").dropna().nunique())
+        if "session_date" in normalized_labeled.columns
+        else 0
+    )
+    current_prediction_days = int(normalized_forecasts["prediction_session"].nunique()) if not normalized_forecasts.empty else 0
+    theoretical_max_prediction_days = (
+        max(0, complete_sessions - int(required_context_sessions))
+        if not np.isnan(required_context_sessions)
+        else float("nan")
+    )
+
+    session_dates = (
+        pd.to_datetime(normalized_labeled["session_date"], utc=True, errors="coerce").dropna().sort_values().unique().tolist()
+        if "session_date" in normalized_labeled.columns
+        else []
+    )
+    summary_record: dict[str, object] = {
+        "complete_sessions": complete_sessions,
+        "slots_per_session": slots_per_session,
+        "context_length": context_length,
+        "required_context_sessions": required_context_sessions,
+        "current_prediction_days": current_prediction_days,
+        "theoretical_max_prediction_days": theoretical_max_prediction_days,
+        "session_start": session_dates[0] if session_dates else pd.NaT,
+        "session_end": session_dates[-1] if session_dates else pd.NaT,
+    }
+    for target_day in target_days:
+        summary_record[f"target_gap_{target_day}d"] = max(0, target_day - current_prediction_days)
+    summary = pd.DataFrame([summary_record])
+
+    rank_ic_daily = baseline_rank_ic[baseline_rank_ic["prediction_session"].notna()].copy()
+    if not rank_ic_daily.empty:
+        rank_ic_daily = _normalize_time_columns(rank_ic_daily, ["prediction_session"])[["prediction_session", "rank_ic"]]
+    stability_daily = normalized_daily.merge(
+        rank_ic_daily,
+        on="prediction_session",
+        how="left",
+        validate="one_to_one",
+    ) if not normalized_daily.empty else pd.DataFrame()
+    if stability_daily.empty:
+        stability_daily = pd.DataFrame(
+            columns=[
+                "signal_session",
+                "prediction_session",
+                "signal_date",
+                "prediction_date",
+                "long_basket_return",
+                "short_basket_return",
+                "long_short_spread",
+                "gross_long_short_pnl",
+                "book_hit",
+                "rank_ic",
+                "cumulative_gross_long_short_pnl",
+                "cumulative_book_hit_rate",
+                "prediction_week",
+            ]
+        )
+    else:
+        stability_daily = stability_daily.sort_values("prediction_session").reset_index(drop=True)
+        stability_daily["cumulative_gross_long_short_pnl"] = stability_daily["gross_long_short_pnl"].fillna(0.0).cumsum()
+        stability_daily["cumulative_book_hit_rate"] = stability_daily["book_hit"].fillna(False).astype(float).expanding().mean()
+        iso_calendar = stability_daily["prediction_session"].dt.isocalendar()
+        stability_daily["prediction_week"] = (
+            iso_calendar["year"].astype(str) + "-W" + iso_calendar["week"].astype(str).str.zfill(2)
+        )
+
+    weekly = pd.DataFrame()
+    if not stability_daily.empty:
+        weekly = (
+            stability_daily.groupby("prediction_week", as_index=False)
+            .agg(
+                prediction_days=("prediction_session", "nunique"),
+                mean_daily_gross_pnl=("gross_long_short_pnl", "mean"),
+                total_gross_pnl=("gross_long_short_pnl", "sum"),
+                mean_daily_long_short_spread=("long_short_spread", "mean"),
+                mean_rank_ic=("rank_ic", "mean"),
+                positive_rank_ic_rate=("rank_ic", lambda series: float((series > 0).mean())),
+                book_hit_rate=("book_hit", lambda series: float(series.astype(float).mean())),
+            )
+            .sort_values("prediction_week")
+            .reset_index(drop=True)
+        )
+
+    if stability_daily.empty:
+        concentration = pd.DataFrame(
+            [
+                {
+                    "prediction_days": 0,
+                    "positive_days": 0,
+                    "negative_days": 0,
+                    "best_day_abs_pnl_share": float("nan"),
+                    "top2_abs_pnl_share": float("nan"),
+                    "best_day_prediction_session": pd.NaT,
+                    "worst_day_prediction_session": pd.NaT,
+                }
+            ]
+        )
+    else:
+        pnl = stability_daily["gross_long_short_pnl"].fillna(0.0)
+        abs_pnl = pnl.abs()
+        total_abs_pnl = float(abs_pnl.sum())
+        ordered_abs = abs_pnl.sort_values(ascending=False).tolist()
+        best_abs_share = float(ordered_abs[0] / total_abs_pnl) if ordered_abs and total_abs_pnl > 0 else float("nan")
+        top2_abs_share = float(sum(ordered_abs[:2]) / total_abs_pnl) if ordered_abs and total_abs_pnl > 0 else float("nan")
+        best_day_index = pnl.idxmax()
+        worst_day_index = pnl.idxmin()
+        concentration = pd.DataFrame(
+            [
+                {
+                    "prediction_days": int(stability_daily["prediction_session"].nunique()),
+                    "positive_days": int((pnl > 0).sum()),
+                    "negative_days": int((pnl < 0).sum()),
+                    "flat_days": int((pnl == 0).sum()),
+                    "total_gross_pnl": float(pnl.sum()),
+                    "total_abs_gross_pnl": total_abs_pnl,
+                    "best_day_gross_pnl": float(pnl.max()),
+                    "worst_day_gross_pnl": float(pnl.min()),
+                    "best_day_abs_pnl_share": best_abs_share,
+                    "top2_abs_pnl_share": top2_abs_share,
+                    "best_day_prediction_session": stability_daily.loc[best_day_index, "prediction_session"],
+                    "worst_day_prediction_session": stability_daily.loc[worst_day_index, "prediction_session"],
+                }
+            ]
+        )
+
+    return summary, stability_daily, weekly, concentration
+
+
+def _build_side_isolation_reports(position_returns: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if position_returns.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    positions = position_returns.copy()
+    positions["hit"] = np.where(
+        positions["side"] == "long",
+        positions["realized_day_return"] > 0,
+        positions["realized_day_return"] < 0,
+    )
+    positions["signed_realized_alpha"] = np.where(
+        positions["side"] == "long",
+        positions["realized_day_return"],
+        -positions["realized_day_return"],
+    )
+
+    daily = (
+        positions.groupby(["prediction_session", "side"], as_index=False)
+        .agg(
+            signal_session=("signal_session", "first"),
+            basket_id_count=("basket_id", "nunique"),
+            position_count=("ticker", "size"),
+            mean_realized_return=("realized_day_return", "mean"),
+            gross_pnl=("gross_position_return", "sum"),
+            hit_rate=("hit", "mean"),
+        )
+        .sort_values(["prediction_session", "side"])
+        .reset_index(drop=True)
+    )
+
+    summary_records: list[dict[str, object]] = []
+    ticker_frames: list[pd.DataFrame] = []
+    for side, side_positions in positions.groupby("side", sort=True):
+        side_daily = daily[daily["side"] == side].copy()
+        total_abs_pnl = float(side_positions["gross_position_return"].abs().sum())
+        ticker_summary = (
+            side_positions.groupby(["side", "ticker", "basket_id"], as_index=False)
+            .agg(
+                days_in_book=("prediction_session", "nunique"),
+                total_gross_pnl=("gross_position_return", "sum"),
+                mean_gross_pnl=("gross_position_return", "mean"),
+                mean_realized_return=("realized_day_return", "mean"),
+                mean_abs_score=("ranking_score", lambda series: float(series.abs().mean())),
+                mean_signed_realized_alpha=("signed_realized_alpha", "mean"),
+                hit_rate=("hit", "mean"),
+            )
+            .sort_values(["total_gross_pnl", "ticker"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        ticker_summary["abs_pnl_share"] = (
+            ticker_summary["total_gross_pnl"].abs() / total_abs_pnl
+            if total_abs_pnl > 0
+            else 0.0
+        )
+        ticker_frames.append(ticker_summary)
+
+        ordered_abs = ticker_summary["abs_pnl_share"].sort_values(ascending=False).tolist()
+        top_ticker = ticker_summary.iloc[0]["ticker"] if not ticker_summary.empty else ""
+        top_ticker_pnl = float(ticker_summary.iloc[0]["total_gross_pnl"]) if not ticker_summary.empty else float("nan")
+        summary_records.append(
+            {
+                "side": side,
+                "prediction_days": int(side_daily["prediction_session"].nunique()),
+                "position_count": int(len(side_positions)),
+                "positive_days": int((side_daily["gross_pnl"] > 0).sum()),
+                "negative_days": int((side_daily["gross_pnl"] < 0).sum()),
+                "mean_daily_gross_pnl": float(side_daily["gross_pnl"].mean()) if not side_daily.empty else float("nan"),
+                "median_daily_gross_pnl": float(side_daily["gross_pnl"].median()) if not side_daily.empty else float("nan"),
+                "mean_daily_realized_return": float(side_daily["mean_realized_return"].mean()) if not side_daily.empty else float("nan"),
+                "hit_rate": float(side_positions["hit"].mean()),
+                "total_gross_pnl": float(side_positions["gross_position_return"].sum()),
+                "top_ticker": top_ticker,
+                "top_ticker_total_gross_pnl": top_ticker_pnl,
+                "top_ticker_abs_pnl_share": float(ordered_abs[0]) if ordered_abs else float("nan"),
+                "top2_ticker_abs_pnl_share": float(sum(ordered_abs[:2])) if ordered_abs else float("nan"),
+            }
+        )
+
+    summary = pd.DataFrame.from_records(summary_records).sort_values("side").reset_index(drop=True)
+    ticker_summary = (
+        pd.concat(ticker_frames, ignore_index=True, sort=False)
+        if ticker_frames
+        else pd.DataFrame()
+    )
+    return summary, daily, ticker_summary
+
+
+def _coerce_short_available(value: object) -> bool:
+    if pd.isna(value):
+        return True
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return bool(int(value))
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "t", "yes", "y", "1", "available", "easy", "etb"}:
+        return True
+    if normalized in {"false", "f", "no", "n", "0", "unavailable", "hard", "htb"}:
+        return False
+    return True
+
+
+def _build_borrow_overlay_reports(
+    *,
+    position_returns: pd.DataFrame,
+    costs_bps: tuple[int, ...],
+    default_borrow_fee_annual_bps: float,
+    borrow_profile: pd.DataFrame | None = None,
+    unavailable_tickers: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if position_returns.empty:
+        empty = pd.DataFrame()
+        return pd.DataFrame(), empty, empty, empty
+
+    unavailable_set = {ticker.strip().upper() for ticker in unavailable_tickers if str(ticker).strip()}
+    profile = pd.DataFrame(columns=["ticker", "borrow_fee_annual_bps", "short_available"])
+    if borrow_profile is not None and not borrow_profile.empty:
+        profile = borrow_profile.copy()
+        if "ticker" not in profile.columns:
+            raise ValueError("Borrow profile must contain a `ticker` column.")
+        profile["ticker"] = profile["ticker"].astype(str).str.upper().str.strip()
+        if "borrow_fee_annual_bps" not in profile.columns:
+            profile["borrow_fee_annual_bps"] = default_borrow_fee_annual_bps
+        profile["borrow_fee_annual_bps"] = pd.to_numeric(profile["borrow_fee_annual_bps"], errors="coerce").fillna(
+            default_borrow_fee_annual_bps
+        )
+        if "short_available" not in profile.columns:
+            profile["short_available"] = True
+        profile["short_available"] = profile["short_available"].apply(_coerce_short_available)
+        profile = profile[["ticker", "borrow_fee_annual_bps", "short_available"]].drop_duplicates(subset=["ticker"], keep="last")
+
+    overlay = position_returns.copy()
+    overlay["ticker"] = overlay["ticker"].astype(str).str.upper()
+    overlay = overlay.merge(profile, on="ticker", how="left", validate="many_to_one")
+    overlay["borrow_fee_annual_bps"] = pd.to_numeric(overlay["borrow_fee_annual_bps"], errors="coerce").fillna(
+        default_borrow_fee_annual_bps
+    )
+    overlay["short_available"] = overlay["short_available"].apply(_coerce_short_available)
+    if unavailable_set:
+        overlay.loc[overlay["ticker"].isin(unavailable_set), "short_available"] = False
+
+    short_mask = overlay["side"] == "short"
+    overlay["borrow_fee_daily_rate"] = 0.0
+    overlay.loc[short_mask, "borrow_fee_daily_rate"] = overlay.loc[short_mask, "borrow_fee_annual_bps"] / 10000.0 / 252.0
+    overlay["borrow_excluded"] = short_mask & (~overlay["short_available"])
+    overlay["executed_weight_after_borrow"] = np.where(overlay["borrow_excluded"], 0.0, overlay["weight"])
+    overlay["borrow_cost"] = np.where(
+        short_mask & (~overlay["borrow_excluded"]),
+        overlay["executed_weight_after_borrow"].abs() * overlay["borrow_fee_daily_rate"],
+        0.0,
+    )
+    overlay["gross_position_return_after_borrow"] = np.where(
+        overlay["borrow_excluded"],
+        0.0,
+        overlay["gross_position_return"] - overlay["borrow_cost"],
+    )
+
+    daily = (
+        overlay.groupby("prediction_session", as_index=False)
+        .agg(
+            gross_return_after_borrow=("gross_position_return_after_borrow", "sum"),
+            gross_exposure_after_borrow=("executed_weight_after_borrow", lambda series: float(series.abs().sum())),
+            borrow_cost=("borrow_cost", "sum"),
+            excluded_short_positions=("borrow_excluded", "sum"),
+            excluded_short_tickers=("ticker", lambda series: 0),
+        )
+        .sort_values("prediction_session")
+        .reset_index(drop=True)
+    )
+    if not overlay.empty:
+        excluded_by_day = (
+            overlay[overlay["borrow_excluded"]]
+            .groupby("prediction_session", as_index=False)["ticker"]
+            .nunique()
+            .rename(columns={"ticker": "excluded_short_tickers"})
+        )
+        if not excluded_by_day.empty:
+            daily = daily.drop(columns=["excluded_short_tickers"]).merge(
+                excluded_by_day,
+                on="prediction_session",
+                how="left",
+                validate="one_to_one",
+            )
+            daily["excluded_short_tickers"] = daily["excluded_short_tickers"].fillna(0).astype(int)
+
+    for cost_bps in costs_bps:
+        cost_rate = cost_bps / 10000.0
+        daily[f"net_return_after_borrow_{cost_bps}bps"] = (
+            daily["gross_return_after_borrow"] - (daily["gross_exposure_after_borrow"] * cost_rate)
+        )
+
+    assumptions = pd.DataFrame(
+        [
+            {
+                "default_borrow_fee_annual_bps": float(default_borrow_fee_annual_bps),
+                "borrow_profile_rows": int(len(profile)),
+                "unavailable_ticker_count": int(len(unavailable_set)),
+                "unavailable_tickers": ",".join(sorted(unavailable_set)),
+                "overlay_mode": "basic_short_borrow_overlay",
+                "availability_treatment": "exclude_unavailable_shorts_without_reweighting",
+                "fee_treatment": "subtract_daily_borrow_fee_from_executed_short_positions",
+            }
+        ]
+    )
+
+    short_positions = overlay[short_mask].copy()
+    summary = pd.DataFrame(
+        [
+            {
+                "prediction_days": int(daily["prediction_session"].nunique()),
+                "gross_sharpe": float(_annualized_sharpe(daily["gross_return_after_borrow"])),
+                "net_sharpe_10bps": float(_annualized_sharpe(daily["net_return_after_borrow_10bps"])) if "net_return_after_borrow_10bps" in daily.columns else float("nan"),
+                "net_sharpe_20bps": float(_annualized_sharpe(daily["net_return_after_borrow_20bps"])) if "net_return_after_borrow_20bps" in daily.columns else float("nan"),
+                "net_sharpe_40bps": float(_annualized_sharpe(daily["net_return_after_borrow_40bps"])) if "net_return_after_borrow_40bps" in daily.columns else float("nan"),
+                "mean_daily_gross_return_after_borrow": float(daily["gross_return_after_borrow"].mean()),
+                "mean_daily_borrow_cost": float(daily["borrow_cost"].mean()),
+                "excluded_short_positions": int(short_positions["borrow_excluded"].sum()),
+                "excluded_prediction_days": int(short_positions.loc[short_positions["borrow_excluded"], "prediction_session"].nunique()),
+                "mean_short_borrow_fee_annual_bps": float(short_positions["borrow_fee_annual_bps"].mean()) if not short_positions.empty else float("nan"),
+                "total_borrow_cost": float(short_positions["borrow_cost"].sum()) if not short_positions.empty else 0.0,
+                "short_available_rate": float((~short_positions["borrow_excluded"]).mean()) if not short_positions.empty else float("nan"),
+            }
+        ]
+    )
+
+    ticker_summary = pd.DataFrame()
+    if not short_positions.empty:
+        ticker_summary = (
+            short_positions.groupby(["ticker", "basket_id"], as_index=False)
+            .agg(
+                short_days=("prediction_session", "nunique"),
+                excluded_short_days=("borrow_excluded", "sum"),
+                mean_borrow_fee_annual_bps=("borrow_fee_annual_bps", "mean"),
+                total_borrow_cost=("borrow_cost", "sum"),
+                total_gross_pnl_before_borrow=("gross_position_return", "sum"),
+                total_gross_pnl_after_borrow=("gross_position_return_after_borrow", "sum"),
+                short_available_rate=("borrow_excluded", lambda series: float((~series.astype(bool)).mean())),
+            )
+            .sort_values(["total_gross_pnl_after_borrow", "ticker"], ascending=[False, True])
+            .reset_index(drop=True)
+        )
+        ticker_summary["borrow_pnl_drag"] = (
+            ticker_summary["total_gross_pnl_before_borrow"] - ticker_summary["total_gross_pnl_after_borrow"]
+        )
+
+    return assumptions, summary, daily, overlay.sort_values(["prediction_session", "side", "rank", "ticker"]).reset_index(drop=True), ticker_summary
+
+
 def build_backtest_scorecard(
     *,
     forecasts: pd.DataFrame,
@@ -1655,8 +2057,13 @@ def build_backtest_scorecard(
     baseline_summary = signal_outputs.get("signal_execution_baseline_summary", pd.DataFrame())
     score_behavior = signal_outputs.get("score_behavior_summary", pd.DataFrame())
     basket_book_comparison = signal_outputs.get("basket_book_comparison", pd.DataFrame())
+    side_book_comparison = signal_outputs.get("side_book_comparison", pd.DataFrame())
     ticker_attribution_summary = signal_outputs.get("ticker_attribution_summary", pd.DataFrame())
     live_scoreboard_daily = signal_outputs.get("live_scoreboard_daily", pd.DataFrame())
+    oos_window_summary = signal_outputs.get("oos_window_summary", pd.DataFrame())
+    oos_concentration_summary = signal_outputs.get("oos_concentration_summary", pd.DataFrame())
+    side_isolation_summary = signal_outputs.get("side_isolation_summary", pd.DataFrame())
+    borrow_overlay_summary = signal_outputs.get("borrow_overlay_summary", pd.DataFrame())
     execution_sensitivity = execution_outputs.get("execution_sensitivity_comparison", pd.DataFrame())
 
     if baseline_summary.empty:
@@ -1667,6 +2074,16 @@ def build_backtest_scorecard(
     basket_lookup = (
         basket_book_comparison.set_index("basket_slice")
         if not basket_book_comparison.empty and "basket_slice" in basket_book_comparison.columns
+        else pd.DataFrame()
+    )
+    side_lookup = (
+        side_book_comparison.set_index("side_slice")
+        if not side_book_comparison.empty and "side_slice" in side_book_comparison.columns
+        else pd.DataFrame()
+    )
+    side_isolation_lookup = (
+        side_isolation_summary.set_index("side")
+        if not side_isolation_summary.empty and "side" in side_isolation_summary.columns
         else pd.DataFrame()
     )
     execution_lookup = (
@@ -1680,6 +2097,9 @@ def build_backtest_scorecard(
             return float("nan")
         return float(frame.loc[row_key, column])
 
+    oos_row = oos_window_summary.iloc[0] if not oos_window_summary.empty else pd.Series(dtype=object)
+    oos_concentration_row = oos_concentration_summary.iloc[0] if not oos_concentration_summary.empty else pd.Series(dtype=object)
+    borrow_row = borrow_overlay_summary.iloc[0] if not borrow_overlay_summary.empty else pd.Series(dtype=object)
     book_hit_rate = float(live_scoreboard_daily["book_hit"].mean()) if not live_scoreboard_daily.empty else float("nan")
     row = {
         "universe_size": int(forecasts["ticker"].nunique()) if not forecasts.empty else 0,
@@ -1708,6 +2128,9 @@ def build_backtest_scorecard(
         "combined_mean_daily_return": _lookup(basket_lookup, "combined", "mean_daily_return"),
         "growth_only_mean_daily_return": _lookup(basket_lookup, "growth_only", "mean_daily_return"),
         "defensive_only_mean_daily_return": _lookup(basket_lookup, "defensive_only", "mean_daily_return"),
+        "long_only_net_sharpe_10bps": _lookup(side_lookup, "long_only", "net_sharpe_10bps"),
+        "short_only_net_sharpe_10bps": _lookup(side_lookup, "short_only", "net_sharpe_10bps"),
+        "long_short_net_sharpe_10bps": _lookup(side_lookup, "long_short", "net_sharpe_10bps"),
         "exact_open_net_sharpe_10bps": _lookup(execution_lookup, "exact_open", "net_sharpe_10bps"),
         "exact_open_net_sharpe_20bps": _lookup(execution_lookup, "exact_open", "net_sharpe_20bps"),
         "exact_open_net_sharpe_40bps": _lookup(execution_lookup, "exact_open", "net_sharpe_40bps"),
@@ -1717,6 +2140,22 @@ def build_backtest_scorecard(
         "first_15m_avg_net_sharpe_10bps": _lookup(execution_lookup, "first_15m_avg", "net_sharpe_10bps"),
         "first_15m_avg_net_sharpe_20bps": _lookup(execution_lookup, "first_15m_avg", "net_sharpe_20bps"),
         "first_15m_avg_net_sharpe_40bps": _lookup(execution_lookup, "first_15m_avg", "net_sharpe_40bps"),
+        "oos_complete_sessions": oos_row.get("complete_sessions", float("nan")),
+        "oos_required_context_sessions": oos_row.get("required_context_sessions", float("nan")),
+        "oos_theoretical_max_prediction_days": oos_row.get("theoretical_max_prediction_days", float("nan")),
+        "oos_target_gap_20d": oos_row.get("target_gap_20d", float("nan")),
+        "oos_target_gap_30d": oos_row.get("target_gap_30d", float("nan")),
+        "best_day_abs_pnl_share": oos_concentration_row.get("best_day_abs_pnl_share", float("nan")),
+        "top2_abs_pnl_share": oos_concentration_row.get("top2_abs_pnl_share", float("nan")),
+        "long_side_top_ticker_abs_pnl_share": _lookup(side_isolation_lookup, "long", "top_ticker_abs_pnl_share"),
+        "short_side_top_ticker_abs_pnl_share": _lookup(side_isolation_lookup, "short", "top_ticker_abs_pnl_share"),
+        "borrow_overlay_net_sharpe_10bps": borrow_row.get("net_sharpe_10bps", float("nan")),
+        "borrow_overlay_net_sharpe_20bps": borrow_row.get("net_sharpe_20bps", float("nan")),
+        "borrow_overlay_net_sharpe_40bps": borrow_row.get("net_sharpe_40bps", float("nan")),
+        "borrow_overlay_excluded_short_positions": borrow_row.get("excluded_short_positions", float("nan")),
+        "borrow_overlay_excluded_prediction_days": borrow_row.get("excluded_prediction_days", float("nan")),
+        "borrow_overlay_mean_daily_borrow_cost": borrow_row.get("mean_daily_borrow_cost", float("nan")),
+        "borrow_overlay_mean_short_fee_annual_bps": borrow_row.get("mean_short_borrow_fee_annual_bps", float("nan")),
         "top_contributors": _format_top_tickers(ticker_attribution_summary, ascending=False),
         "top_drags": _format_top_tickers(ticker_attribution_summary, ascending=True),
         "execution_mode_label": STRICT_EXECUTION_MODE_LABEL,
@@ -1815,6 +2254,9 @@ def generate_signal_execution_analysis(
     tail_fractions: tuple[float, ...] = (0.10, 0.15, 0.20),
     book_mode: str = "fixed_count",
     tail_fraction: float | None = None,
+    default_borrow_fee_annual_bps: float = 30.0,
+    borrow_profile: pd.DataFrame | None = None,
+    unavailable_tickers: tuple[str, ...] = (),
 ) -> dict[str, pd.DataFrame]:
     normalized_forecasts = _normalize_time_columns(forecasts, ["signal_session", "prediction_session"])
 
@@ -1871,6 +2313,28 @@ def generate_signal_execution_analysis(
         labeled_frame=labeled_frame,
     )
     live_scoreboard_daily = _build_live_scoreboard_daily(live_scoreboard_positions)
+    oos_window_summary, oos_stability_daily, oos_stability_weekly, oos_concentration_summary = _build_oos_window_reports(
+        forecasts=normalized_forecasts,
+        labeled_frame=labeled_frame,
+        live_scoreboard_daily=live_scoreboard_daily,
+        baseline_rank_ic=baseline_rank_ic,
+    )
+    side_isolation_summary, side_isolation_daily, side_isolation_ticker_summary = _build_side_isolation_reports(
+        baseline_position_returns
+    )
+    (
+        borrow_overlay_assumptions,
+        borrow_overlay_summary,
+        borrow_overlay_daily,
+        borrow_overlay_positions,
+        borrow_overlay_ticker_summary,
+    ) = _build_borrow_overlay_reports(
+        position_returns=baseline_position_returns,
+        costs_bps=costs_bps,
+        default_borrow_fee_annual_bps=default_borrow_fee_annual_bps,
+        borrow_profile=borrow_profile,
+        unavailable_tickers=unavailable_tickers,
+    )
 
     outputs = {
         "signal_execution_baseline_summary": baseline_summary,
@@ -1892,6 +2356,18 @@ def generate_signal_execution_analysis(
         "ticker_attribution_daily": ticker_attribution_daily,
         "live_scoreboard_positions": live_scoreboard_positions,
         "live_scoreboard_daily": live_scoreboard_daily,
+        "oos_window_summary": oos_window_summary,
+        "oos_stability_daily": oos_stability_daily,
+        "oos_stability_weekly": oos_stability_weekly,
+        "oos_concentration_summary": oos_concentration_summary,
+        "side_isolation_summary": side_isolation_summary,
+        "side_isolation_daily": side_isolation_daily,
+        "side_isolation_ticker_summary": side_isolation_ticker_summary,
+        "borrow_overlay_assumptions": borrow_overlay_assumptions,
+        "borrow_overlay_summary": borrow_overlay_summary,
+        "borrow_overlay_daily": borrow_overlay_daily,
+        "borrow_overlay_positions": borrow_overlay_positions,
+        "borrow_overlay_ticker_summary": borrow_overlay_ticker_summary,
     }
     return outputs
 

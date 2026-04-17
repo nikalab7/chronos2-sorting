@@ -1149,6 +1149,11 @@ def export_chronos_package(
             "side_book_comparison.csv",
             "execution_sensitivity_comparison.csv",
             "ticker_attribution_summary.csv",
+            "oos_window_summary.csv",
+            "oos_concentration_summary.csv",
+            "side_isolation_summary.csv",
+            "borrow_overlay_summary.csv",
+            "borrow_overlay_ticker_summary.csv",
         ]:
             source = analysis_dir / filename
             if source.exists():

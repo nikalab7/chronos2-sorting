@@ -40,6 +40,7 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_V2_BETA_MODE = "unit_beta_1.0"
 DEFAULT_V2_BOOK_MODE = "tail_fraction"
 DEFAULT_V2_TAIL_FRACTION = 0.10
+DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS = 30.0
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class ResearchConfig:
     default_v2_beta_mode: str = DEFAULT_V2_BETA_MODE
     default_v2_book_mode: str = DEFAULT_V2_BOOK_MODE
     default_v2_tail_fraction: float = DEFAULT_V2_TAIL_FRACTION
+    default_short_borrow_fee_annual_bps: float = DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS
     liquid_universe: tuple[str, ...] = field(default_factory=lambda: DEFAULT_LIQUID_SP500)
     realized_vol_window: int = 20
 

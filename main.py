@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 
 from chronos_equity_prototype.config import (  # noqa: E402
     DEFAULT_LIQUID_SP500,
+    DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS,
     DEFAULT_V2_BETA_MODE,
     DEFAULT_V2_BOOK_MODE,
     DEFAULT_V2_TAIL_FRACTION,
@@ -385,6 +386,11 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
     side_book_comparison = _read_csv_if_exists(analysis_dir / "side_book_comparison.csv")
     execution_sensitivity = _read_csv_if_exists(analysis_dir / "execution_sensitivity_comparison.csv")
     ticker_attribution = _read_csv_if_exists(analysis_dir / "ticker_attribution_summary.csv")
+    oos_window_summary = _read_csv_if_exists(analysis_dir / "oos_window_summary.csv")
+    oos_concentration_summary = _read_csv_if_exists(analysis_dir / "oos_concentration_summary.csv")
+    side_isolation_summary = _read_csv_if_exists(analysis_dir / "side_isolation_summary.csv")
+    borrow_overlay_summary = _read_csv_if_exists(analysis_dir / "borrow_overlay_summary.csv")
+    borrow_overlay_ticker_summary = _read_csv_if_exists(analysis_dir / "borrow_overlay_ticker_summary.csv")
 
     if not baseline_summary.empty:
         _print_section("Backtest Baseline")
@@ -403,6 +409,36 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
                 "short_hit_rate",
                 "top1_capture_mean",
                 "top5_capture_mean",
+            ],
+        )
+
+    if not oos_window_summary.empty:
+        _print_section("OOS Window")
+        _print_dataframe(
+            oos_window_summary,
+            columns=[
+                "complete_sessions",
+                "context_length",
+                "required_context_sessions",
+                "current_prediction_days",
+                "theoretical_max_prediction_days",
+                "target_gap_20d",
+                "target_gap_30d",
+            ],
+        )
+
+    if not oos_concentration_summary.empty:
+        _print_section("OOS Concentration")
+        _print_dataframe(
+            oos_concentration_summary,
+            columns=[
+                "prediction_days",
+                "positive_days",
+                "negative_days",
+                "best_day_abs_pnl_share",
+                "top2_abs_pnl_share",
+                "best_day_gross_pnl",
+                "worst_day_gross_pnl",
             ],
         )
 
@@ -439,6 +475,22 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
             ],
         )
 
+    if not side_isolation_summary.empty:
+        _print_section("Side Isolation")
+        _print_dataframe(
+            side_isolation_summary,
+            columns=[
+                "side",
+                "prediction_days",
+                "mean_daily_gross_pnl",
+                "hit_rate",
+                "total_gross_pnl",
+                "top_ticker",
+                "top_ticker_abs_pnl_share",
+                "top2_ticker_abs_pnl_share",
+            ],
+        )
+
     if not execution_sensitivity.empty:
         _print_section("Execution Regimes")
         _print_dataframe(
@@ -455,6 +507,23 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
             ],
         )
 
+    if not borrow_overlay_summary.empty:
+        _print_section("Borrow Overlay")
+        _print_dataframe(
+            borrow_overlay_summary,
+            columns=[
+                "prediction_days",
+                "gross_sharpe",
+                "net_sharpe_10bps",
+                "net_sharpe_20bps",
+                "net_sharpe_40bps",
+                "mean_daily_borrow_cost",
+                "excluded_short_positions",
+                "excluded_prediction_days",
+                "mean_short_borrow_fee_annual_bps",
+            ],
+        )
+
     if not ticker_attribution.empty:
         _print_section("Top Ticker Contributors")
         _print_dataframe(
@@ -467,6 +536,22 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
                 "mean_abs_score",
                 "mean_signed_realized_alpha",
                 "total_gross_pnl",
+            ],
+            max_rows=15,
+        )
+
+    if not borrow_overlay_ticker_summary.empty:
+        _print_section("Borrow-Adjusted Shorts")
+        _print_dataframe(
+            borrow_overlay_ticker_summary.sort_values(["borrow_pnl_drag", "ticker"], ascending=[False, True]),
+            columns=[
+                "ticker",
+                "basket_id",
+                "short_days",
+                "excluded_short_days",
+                "mean_borrow_fee_annual_bps",
+                "borrow_pnl_drag",
+                "total_gross_pnl_after_borrow",
             ],
             max_rows=15,
         )
@@ -540,6 +625,14 @@ def _normalize_analysis_tail_fractions(value: object) -> list[float]:
     if isinstance(value, (list, tuple)):
         return [float(item) for item in value]
     return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def _normalize_optional_tickers(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item).strip().upper() for item in value if str(item).strip())
+    return tuple(item.strip().upper() for item in str(value).split(",") if item.strip())
 
 
 def _print_workstation_banner() -> None:
@@ -744,6 +837,9 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
             tail_fractions=tuple(args.analysis_tail_fractions),
             execution_interval=args.execution_interval,
             execution_mode=args.execution_mode,
+            default_borrow_fee_annual_bps=args.borrow_fee_annual_bps,
+            borrow_profile_path=Path(args.borrow_profile_csv) if args.borrow_profile_csv else None,
+            unavailable_tickers=_normalize_optional_tickers(args.borrow_unavailable_tickers),
         )
     _print_backtest_summary(experiment_dir, analysis_dir)
 
@@ -829,6 +925,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="0.10,0.15,0.20",
         help="Comma-separated tail fractions used by analyze-signal in backtest mode.",
     )
+    parser.add_argument("--borrow-fee-annual-bps", type=float, default=DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS)
+    parser.add_argument("--borrow-profile-csv", help="Optional CSV with ticker, borrow_fee_annual_bps, short_available.")
+    parser.add_argument("--borrow-unavailable-tickers", help="Optional comma-separated short tickers to exclude in borrow overlay.")
     return parser
 
 

@@ -8,6 +8,7 @@ import pandas as pd
 
 from .config import (
     DEFAULT_LIQUID_SP500,
+    DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS,
     DEFAULT_V2_BETA_MODE,
     DEFAULT_V2_BOOK_MODE,
     DEFAULT_V2_TAIL_FRACTION,
@@ -62,6 +63,12 @@ def _resolve_context_length(args: argparse.Namespace, research_config: ResearchC
 
 def _parse_tail_fractions(value: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _parse_optional_tickers(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(ticker.strip().upper() for ticker in value.split(",") if ticker.strip())
 
 
 def _build_experiment_name(args: argparse.Namespace) -> str:
@@ -186,6 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--tail-fractions", default="0.10,0.15,0.20")
     analyze_parser.add_argument("--execution-interval", default="5m")
     analyze_parser.add_argument("--execution-mode", default="strict", choices=("strict",))
+    analyze_parser.add_argument("--borrow-fee-annual-bps", type=float, default=DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS)
+    analyze_parser.add_argument("--borrow-profile-csv", help="Optional CSV with ticker, borrow_fee_annual_bps, short_available.")
+    analyze_parser.add_argument("--borrow-unavailable-tickers", help="Optional comma-separated short tickers to exclude in the borrow overlay.")
 
     reconcile_parser = subparsers.add_parser(
         "reconcile-live",
@@ -273,6 +283,9 @@ def main() -> None:
             tail_fractions=_parse_tail_fractions(args.tail_fractions),
             execution_interval=args.execution_interval,
             execution_mode=args.execution_mode,
+            default_borrow_fee_annual_bps=args.borrow_fee_annual_bps,
+            borrow_profile_path=Path(args.borrow_profile_csv) if args.borrow_profile_csv else None,
+            unavailable_tickers=_parse_optional_tickers(args.borrow_unavailable_tickers),
         )
         print(f"Wrote signal analysis outputs to {output_dir}")
         return
