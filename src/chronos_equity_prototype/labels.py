@@ -16,6 +16,7 @@ class LabelBuilder:
 
         labeled = frame.copy().sort_values(["ticker", "timestamp"]).reset_index(drop=True)
         labeled["slot_log_return"] = np.log(labeled["close"] / labeled["open"])
+        labeled["raw_slot_return"] = labeled["slot_log_return"]
 
         benchmark_frame = labeled[labeled["ticker"] == benchmark][["session_date", "slot_id", "slot_log_return"]].rename(
             columns={"slot_log_return": "benchmark_slot_return"}

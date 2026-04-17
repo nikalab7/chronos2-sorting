@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,8 @@ class ExperimentResult:
     book: Book
     metrics: MetricsReport
     rank_ic_summary: pd.DataFrame
+    data_quality_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    data_quality_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass(frozen=True)
@@ -58,3 +60,5 @@ class LivePredictionResult:
     forecasts: ForecastBatch
     book: Book
     prediction_summary: pd.DataFrame
+    data_quality_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    data_quality_summary: pd.DataFrame = field(default_factory=pd.DataFrame)

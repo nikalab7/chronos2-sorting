@@ -99,7 +99,7 @@ class SessionNormalizer:
             ts = ts.dt.tz_convert(ZoneInfo(self.market_timezone))
         return ts
 
-    def normalize(self, raw_bars: pd.DataFrame) -> pd.DataFrame:
+    def normalize(self, raw_bars: pd.DataFrame, drop_incomplete_sessions: bool = True) -> pd.DataFrame:
         if raw_bars.empty:
             return pd.DataFrame(
                 columns=["ticker", "session_date", "slot_id", "timestamp", "open", "high", "low", "close", "volume"]
@@ -114,6 +114,10 @@ class SessionNormalizer:
 
         frame = frame.drop_duplicates(subset=["ticker", "timestamp"], keep="last")
         frame = frame.sort_values(["ticker", "session_date", "slot_id"])
+
+        if not drop_incomplete_sessions:
+            ordered_columns = ["ticker", "session_date", "slot_id", "timestamp", "open", "high", "low", "close", "volume"]
+            return frame[ordered_columns].reset_index(drop=True)
 
         slot_counts = frame.groupby(["ticker", "session_date"])["slot_id"].nunique().rename("slot_count").reset_index()
         complete_sessions = slot_counts[slot_counts["slot_count"] == len(self.slot_schedule)][["ticker", "session_date"]]

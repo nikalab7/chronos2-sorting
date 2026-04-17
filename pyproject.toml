@@ -13,6 +13,7 @@ dependencies = [
   "pandas>=2.2",
   "yfinance>=0.2.65",
   "chronos-forecasting>=2.2",
+  "matplotlib>=3.8",
 ]
 
 [tool.setuptools]

@@ -85,3 +85,30 @@ class ZeroShotForecaster:
 
         frame = pd.DataFrame.from_records(records).sort_values(["signal_session", "ticker"]).reset_index(drop=True)
         return ForecastBatch(frame=frame)
+
+    def predict_dataframe(
+        self,
+        df: pd.DataFrame,
+        *,
+        model_id: str,
+        config: ForecasterConfig,
+        target_columns: list[str] | tuple[str, ...],
+        future_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+
+        pipeline = self._get_pipeline(model_id)
+        return pipeline.predict_df(
+            df=df,
+            future_df=future_df,
+            id_column="item_id",
+            timestamp_column="timestamp",
+            target=list(target_columns),
+            prediction_length=config.prediction_length,
+            quantile_levels=list(config.quantiles),
+            batch_size=config.batch_size,
+            context_length=config.context_length,
+            cross_learning=config.cross_learning,
+            validate_inputs=True,
+        )
