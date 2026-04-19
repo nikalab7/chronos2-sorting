@@ -99,3 +99,94 @@ class PortfolioBuilder:
                 records.append(record)
 
         return Book(frame=pd.DataFrame.from_records(records).sort_values(["signal_session", "side", "ticker"]).reset_index(drop=True))
+
+    def select_winners(
+        self,
+        forecasts: ForecastBatch | pd.DataFrame,
+        *,
+        score_column: str = "winner_score",
+        max_fraction: float = 0.10,
+    ) -> Book:
+        frame = forecasts.frame.copy() if isinstance(forecasts, ForecastBatch) else forecasts.copy()
+        empty_columns = [
+            "signal_session",
+            "prediction_session",
+            "ticker",
+            "side",
+            "rank",
+            "weight",
+            "ranking_score_column",
+            "ranking_score",
+            "book_mode",
+            "tail_fraction",
+            "tail_size",
+            "book_active",
+        ]
+        if frame.empty:
+            return Book(frame=pd.DataFrame(columns=empty_columns))
+        if score_column not in frame.columns:
+            raise ValueError(f"Score column {score_column!r} is not present in the forecast frame.")
+        if max_fraction <= 0 or max_fraction >= 1:
+            raise ValueError("Winner selection requires max_fraction to be between 0 and 1.")
+
+        extra_columns = [
+            column
+            for column in [
+                "basket_id",
+                "score_plain",
+                "score_risk",
+                "score_z",
+                "winner_score",
+                "pred_ret_1d",
+                "pred_alpha_1d",
+                "pred_ret_3d",
+                "pred_alpha_3d",
+                "confidence_proxy",
+                "signal_label",
+                "buy_eligible",
+                "confirmed_3d",
+                "beta_mode",
+                "product_mode",
+            ]
+            if column in frame.columns
+        ]
+        records: list[dict[str, object]] = []
+        group_column = "prediction_session" if "prediction_session" in frame.columns else "signal_session"
+
+        for group_value, day_frame in frame.groupby(group_column, sort=True):
+            ordered = day_frame.sort_values([score_column, "ticker"], ascending=[False, True]).reset_index(drop=True)
+            eligible = ordered.copy()
+            if "buy_eligible" in eligible.columns:
+                eligible = eligible[eligible["buy_eligible"] == True]  # noqa: E712
+            if "confirmed_3d" in eligible.columns:
+                eligible = eligible[eligible["confirmed_3d"] == True]  # noqa: E712
+            if eligible.empty:
+                continue
+
+            max_picks = max(1, int(ceil(len(ordered) * max_fraction)))
+            selected = eligible.head(max_picks).copy().reset_index(drop=True)
+            weight = 1.0 / len(selected)
+
+            for rank, (_, row) in enumerate(selected.iterrows(), start=1):
+                record = {
+                    "signal_session": row["signal_session"],
+                    "prediction_session": row["prediction_session"],
+                    "ticker": row["ticker"],
+                    "side": "long",
+                    "rank": rank,
+                    "weight": weight,
+                    "ranking_score_column": score_column,
+                    "ranking_score": row[score_column],
+                    "book_mode": "winner_top_fraction",
+                    "tail_fraction": max_fraction,
+                    "tail_size": len(selected),
+                    "book_active": True,
+                }
+                for column in extra_columns:
+                    record[column] = row[column]
+                records.append(record)
+
+        winner_frame = pd.DataFrame.from_records(records)
+        if winner_frame.empty:
+            return Book(frame=pd.DataFrame(columns=empty_columns + extra_columns))
+        return Book(frame=winner_frame.sort_values(["prediction_session", "rank", "ticker"]).reset_index(drop=True))

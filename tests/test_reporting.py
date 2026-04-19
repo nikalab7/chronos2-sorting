@@ -260,7 +260,7 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue((output_dir / "README.txt").exists())
 
             prediction_board = pd.read_csv(output_dir / "prediction_board.csv")
-            self.assertIn("confidence_score", prediction_board.columns)
+            self.assertIn("confidence_proxy", prediction_board.columns)
             self.assertIn("prediction_rank_desc", prediction_board.columns)
             self.assertIn("in_book", prediction_board.columns)
             self.assertIn("selection_status", prediction_board.columns)

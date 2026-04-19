@@ -8,10 +8,13 @@ import pandas as pd
 
 from .config import (
     DEFAULT_LIQUID_SP500,
+    DEFAULT_PRODUCT_MODE,
     DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS,
     DEFAULT_V2_BETA_MODE,
     DEFAULT_V2_BOOK_MODE,
     DEFAULT_V2_TAIL_FRACTION,
+    DEFAULT_WINNER_CONFIRMATION_MODES,
+    DEFAULT_WINNER_CONFIRMATION_MODE,
     ForecasterConfig,
     ResearchConfig,
 )
@@ -74,8 +77,19 @@ def _parse_optional_tickers(value: str | None) -> tuple[str, ...]:
 def _build_experiment_name(args: argparse.Namespace) -> str:
     model_slug = _model_slug(args.model_id)
     if args.architecture == "v2_flagship_basket_raw":
+        if getattr(args, "product_mode", DEFAULT_PRODUCT_MODE) == "winner_picker":
+            return (
+                f"{args.architecture}_{args.basket_mode}_{args.product_mode}_{model_slug}_ctx{args.context_length}_"
+                f"confirm{args.confirmation_mode}_cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}_"
+                f"beta{args.beta_mode}"
+            )
         return (
             f"{args.architecture}_{args.basket_mode}_{model_slug}_ctx{args.context_length}_"
+            f"cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}"
+        )
+    if getattr(args, "product_mode", DEFAULT_PRODUCT_MODE) != "ranker":
+        return (
+            f"{args.architecture}_{args.product_mode}_{model_slug}_ctx{args.context_length}_"
             f"cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}"
         )
     return f"{model_slug}_ctx{args.context_length}_cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}"
@@ -102,6 +116,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--no-covariates", action="store_true", help="Run the pure-univariate variant.")
     run_parser.add_argument("--matrix", action="store_true", help="Run the plan ablation matrix.")
     run_parser.add_argument(
+        "--product-mode",
+        default=DEFAULT_PRODUCT_MODE,
+        choices=("ranker", "winner_picker"),
+        help="User-facing product mode. winner_picker is V2-only.",
+    )
+    run_parser.add_argument(
+        "--confirmation-mode",
+        default=DEFAULT_WINNER_CONFIRMATION_MODE,
+        choices=DEFAULT_WINNER_CONFIRMATION_MODES,
+        help="Winner-picker confirmation mode.",
+    )
+    run_parser.add_argument(
         "--architecture",
         default="v1_residual",
         choices=("v1_residual", "v2_flagship_basket_raw"),
@@ -116,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--beta-mode",
         default=DEFAULT_V2_BETA_MODE,
-        choices=("unit_beta_1.0", "pooled_beta_140"),
+        choices=("unit_beta_1.0", "pooled_beta_140", "rolling_session_beta_20d"),
         help="V2 beta handling mode.",
     )
     run_parser.add_argument(
@@ -151,6 +177,18 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--cross-learning", action="store_true", help="Enable Chronos-2 cross-learning.")
     predict_parser.add_argument("--no-covariates", action="store_true", help="Run the pure-univariate variant.")
     predict_parser.add_argument(
+        "--product-mode",
+        default=DEFAULT_PRODUCT_MODE,
+        choices=("ranker", "winner_picker"),
+        help="User-facing product mode. winner_picker is V2-only.",
+    )
+    predict_parser.add_argument(
+        "--confirmation-mode",
+        default=DEFAULT_WINNER_CONFIRMATION_MODE,
+        choices=DEFAULT_WINNER_CONFIRMATION_MODES,
+        help="Winner-picker confirmation mode.",
+    )
+    predict_parser.add_argument(
         "--architecture",
         default="v1_residual",
         choices=("v1_residual", "v2_flagship_basket_raw"),
@@ -166,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument(
         "--beta-mode",
         default=DEFAULT_V2_BETA_MODE,
-        choices=("unit_beta_1.0", "pooled_beta_140"),
+        choices=("unit_beta_1.0", "pooled_beta_140", "rolling_session_beta_20d"),
         help="V2 beta handling mode.",
     )
     predict_parser.add_argument(
@@ -213,6 +251,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_parser.add_argument("--execution-interval", default="5m")
     reconcile_parser.add_argument("--execution-mode", default="strict", choices=("strict",))
+    reconcile_parser.add_argument(
+        "--product-mode",
+        default=DEFAULT_PRODUCT_MODE,
+        choices=("ranker", "winner_picker"),
+        help="Optional expected product mode. Prediction files remain the source of truth.",
+    )
 
     chronos_parser = subparsers.add_parser(
         "chronos-report",
@@ -234,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
     chronos_parser.add_argument(
         "--output-dir",
         help="Optional output directory. Defaults to outputs/chronos_<today>.",
+    )
+    chronos_parser.add_argument(
+        "--product-mode",
+        default=DEFAULT_PRODUCT_MODE,
+        choices=("ranker", "winner_picker"),
+        help="Optional expected product mode. Prediction files remain the source of truth.",
     )
     return parser
 
@@ -262,12 +312,15 @@ def main() -> None:
 
     if args.command == "reconcile-live":
         pipeline = ZeroShotResearchPipeline()
-        pipeline.reconcile_live_prediction(
-            prediction_dir=Path(args.prediction_dir),
-            ledger_dir=Path(args.ledger_dir),
-            execution_interval=args.execution_interval,
-            execution_mode=args.execution_mode,
-        )
+        try:
+            pipeline.reconcile_live_prediction(
+                prediction_dir=Path(args.prediction_dir),
+                ledger_dir=Path(args.ledger_dir),
+                execution_interval=args.execution_interval,
+                execution_mode=args.execution_mode,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         print(f"Wrote live reconciliation outputs to {Path(args.ledger_dir)}")
         return
 
@@ -298,10 +351,16 @@ def main() -> None:
 
     tickers = _resolve_v2_tickers(_parse_tickers(args), args)
     default_contexts = ResearchConfig()
+    if args.product_mode == "winner_picker" and args.architecture != "v2_flagship_basket_raw":
+        raise SystemExit("winner_picker is supported only with --architecture v2_flagship_basket_raw.")
     resolved_context_length = _resolve_context_length(args, default_contexts)
     research_config = ResearchConfig(
         model_id=args.model_id,
-        prediction_length=args.prediction_length,
+        prediction_length=(
+            default_contexts.winner_prediction_length
+            if args.product_mode == "winner_picker"
+            else args.prediction_length
+        ),
         default_context_length=default_contexts.default_context_length if args.context_length is None else args.context_length,
         benchmark_ticker=args.benchmark.upper(),
         batch_size=args.batch_size,
@@ -325,22 +384,29 @@ def main() -> None:
         v2_base_frame = pd.DataFrame()
 
     if args.command == "run" and args.matrix and args.architecture == "v2_flagship_basket_raw":
-        matrix_results = pipeline.run_v2_matrix(
-            v2_base_frame,
-            basket_mode=args.basket_mode,
-            beta_mode=args.beta_mode,
-            book_mode=args.book_mode,
-            tail_fraction=args.tail_fraction,
-        )
+        if args.product_mode == "winner_picker":
+            matrix_results = pipeline.run_v2_winner_matrix(
+                v2_base_frame,
+                basket_mode=args.basket_mode,
+            )
+        else:
+            matrix_results = pipeline.run_v2_matrix(
+                v2_base_frame,
+                basket_mode=args.basket_mode,
+                beta_mode=args.beta_mode,
+                book_mode=args.book_mode,
+                tail_fraction=args.tail_fraction,
+            )
         for experiment_name, result in matrix_results.items():
             ZeroShotResearchPipeline.write_result(output_dir / experiment_name, result)
-        v1_config = research_config.default_forecaster_config(use_covariates=True, cross_learning=False)
-        v1_experiment_name = f"{_model_slug(args.model_id)}_ctx{v1_config.context_length}_cross0_cov1"
-        v1_result = pipeline.run_experiment(labeled_frame, v1_config, v1_experiment_name)
-        ZeroShotResearchPipeline.write_result(output_dir / v1_experiment_name, v1_result)
-        baseline_results = pipeline.run_baselines(labeled_frame)
-        for baseline_name, result in baseline_results.items():
-            ZeroShotResearchPipeline.write_result(output_dir / baseline_name, result)
+        if args.product_mode == "ranker":
+            v1_config = research_config.default_forecaster_config(use_covariates=True, cross_learning=False)
+            v1_experiment_name = f"{_model_slug(args.model_id)}_ctx{v1_config.context_length}_cross0_cov1"
+            v1_result = pipeline.run_experiment(labeled_frame, v1_config, v1_experiment_name)
+            ZeroShotResearchPipeline.write_result(output_dir / v1_experiment_name, v1_result)
+            baseline_results = pipeline.run_baselines(labeled_frame)
+            for baseline_name, result in baseline_results.items():
+                ZeroShotResearchPipeline.write_result(output_dir / baseline_name, result)
         print(f"Wrote matrix outputs to {output_dir}")
         return
 
@@ -354,39 +420,44 @@ def main() -> None:
         print(f"Wrote matrix outputs to {output_dir}")
         return
 
+    quantiles = research_config.winner_quantiles if args.product_mode == "winner_picker" else research_config.quantiles
+    prediction_length = research_config.winner_prediction_length if args.product_mode == "winner_picker" else args.prediction_length
     forecaster_config = ForecasterConfig(
         model_id=args.model_id,
-        prediction_length=args.prediction_length,
+        prediction_length=prediction_length,
         context_length=resolved_context_length,
-        quantiles=(0.1, 0.5, 0.9),
+        quantiles=quantiles,
         cross_learning=args.cross_learning,
         use_covariates=not args.no_covariates,
         batch_size=args.batch_size,
         beta_mode=args.beta_mode,
+        product_mode=args.product_mode,
+        confirmation_mode=args.confirmation_mode,
     )
     experiment_name = _build_experiment_name(args)
     if args.command == "predict-next":
-        if args.architecture == "v2_flagship_basket_raw":
-            result = pipeline.run_v2_next_session_prediction(
-                v2_base_frame,
-                forecaster_config,
-                experiment_name,
-                basket_mode=args.basket_mode,
-                book_mode=args.book_mode,
-                tail_fraction=args.tail_fraction,
-            )
-        else:
-            result = pipeline.run_next_session_prediction(labeled_frame, forecaster_config, experiment_name)
+        try:
+            if args.architecture == "v2_flagship_basket_raw":
+                result = pipeline.run_v2_next_session_prediction(
+                    v2_base_frame,
+                    forecaster_config,
+                    experiment_name,
+                    basket_mode=args.basket_mode,
+                    book_mode=args.book_mode,
+                    tail_fraction=args.tail_fraction,
+                )
+            else:
+                result = pipeline.run_next_session_prediction(labeled_frame, forecaster_config, experiment_name)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         ZeroShotResearchPipeline.write_live_prediction(output_dir / experiment_name, result)
-        if result.book.frame.empty:
+        if result.book.frame.empty and args.product_mode == "ranker":
             print("No next-session prediction was produced. Check history length and universe coverage.")
             return
 
         summary = result.prediction_summary.iloc[0]
-        preview_columns = [column for column in ["side", "rank", "ticker", "basket_id", "score_plain", "score_z", "score_q50"] if column in result.book.frame.columns]
-        preview = result.book.frame[preview_columns].sort_values(["side", "rank", "ticker"])
         print(
-            "Predicted next session book for "
+            "Predicted next session output for "
             f"{pd.Timestamp(summary['prediction_session']).date()} using signal session "
             f"{pd.Timestamp(summary['signal_session']).date()}:"
         )
@@ -401,7 +472,40 @@ def main() -> None:
                 f"({observed_text}) than the latest complete signal session. "
                 "This prediction does not leak future labels, but it may target an already-started session."
             )
-        print(preview.to_string(index=False))
+        if args.product_mode == "winner_picker":
+            winner_top_picks = result.extra_outputs.get("winner_top_picks", pd.DataFrame())
+            winner_board = result.extra_outputs.get("winner_board", pd.DataFrame())
+            preview = winner_top_picks if not winner_top_picks.empty else winner_board.head(12)
+            preview_columns = [
+                column
+                for column in [
+                    "rank",
+                    "ticker",
+                    "basket_id",
+                    "winner_score",
+                    "pred_ret_1d",
+                    "pred_alpha_1d",
+                    "pred_ret_3d",
+                    "pred_alpha_3d",
+                    "confidence_proxy",
+                    "signal_label",
+                    "buy_eligible",
+                    "confirmed_3d",
+                ]
+                if column in preview.columns
+            ]
+            if preview.empty:
+                daily_summary = result.extra_outputs.get("winner_daily_summary", pd.DataFrame())
+                if not daily_summary.empty:
+                    print(daily_summary.to_string(index=False))
+                else:
+                    print("No winner-mode candidates were produced.")
+            else:
+                print(preview[preview_columns].to_string(index=False))
+        else:
+            preview_columns = [column for column in ["side", "rank", "ticker", "basket_id", "score_plain", "score_z"] if column in result.book.frame.columns]
+            preview = result.book.frame[preview_columns].sort_values(["side", "rank", "ticker"])
+            print(preview.to_string(index=False))
         print(f"Wrote next-session outputs to {output_dir / experiment_name}")
         return
 
@@ -418,9 +522,10 @@ def main() -> None:
         result = pipeline.run_experiment(labeled_frame, forecaster_config, experiment_name)
     ZeroShotResearchPipeline.write_result(output_dir / experiment_name, result)
 
-    baseline_results = pipeline.run_baselines(labeled_frame)
-    for baseline_name, baseline_result in baseline_results.items():
-        ZeroShotResearchPipeline.write_result(output_dir / baseline_name, baseline_result)
+    if args.product_mode == "ranker":
+        baseline_results = pipeline.run_baselines(labeled_frame)
+        for baseline_name, baseline_result in baseline_results.items():
+            ZeroShotResearchPipeline.write_result(output_dir / baseline_name, baseline_result)
 
     print(f"Wrote experiment outputs to {output_dir}")
 

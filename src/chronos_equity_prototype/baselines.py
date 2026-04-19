@@ -52,13 +52,6 @@ class BaselineScorer:
             rolling["score_q50"] = rolling[slot_columns].sum(axis=1)
             baseline_frames.append(rolling)
 
-            momentum = ordered.copy()
-            momentum["signal_session"] = ordered["session_date"]
-            momentum["prediction_session"] = next_session
-            momentum["baseline_name"] = "one_day_residual_momentum_rank"
-            momentum["score_q50"] = ordered[slot_columns].sum(axis=1)
-            baseline_frames.append(momentum)
-
         baselines = pd.concat(baseline_frames, ignore_index=True)
         baselines = baselines.dropna(subset=["prediction_session"]).copy()
         baselines = baselines[["ticker", "signal_session", "prediction_session", "baseline_name", "score_q50"]]

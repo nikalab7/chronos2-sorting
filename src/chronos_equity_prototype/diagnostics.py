@@ -1261,7 +1261,9 @@ def summarize_execution_daily_returns(
             "prediction_days": int(mode_frame["prediction_session"].nunique()),
             "gross_sharpe": float(_annualized_sharpe(mode_frame["gross_return"])),
             "mean_daily_gross_return": float(mode_frame["gross_return"].mean()),
-            "mean_daily_long_short_spread": float(mode_frame["gross_return"].mean()),
+            # The live execution book is constructed as a 50/50 dollar-neutral portfolio,
+            # so gross portfolio return is half of the corresponding long-short spread.
+            "mean_daily_long_short_spread": float(2.0 * mode_frame["gross_return"].mean()),
         }
         for cost_bps in costs_bps:
             net_column = f"net_return_{cost_bps}bps"

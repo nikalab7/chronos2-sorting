@@ -83,9 +83,9 @@ def build_prediction_board(
         spy_width = np.array(row.spy_q90_path, dtype=float) - np.array(row.spy_q10_path, dtype=float)
         alpha_uncertainty.append(float(np.sum(stock_width + (abs(float(row.beta_used)) * spy_width))))
     board["alpha_uncertainty"] = alpha_uncertainty
-    board["confidence_score"] = board["score_plain"].abs() / (EPSILON + board["alpha_uncertainty"])
+    board["confidence_proxy"] = board["score_plain"].abs() / (EPSILON + board["alpha_uncertainty"])
     board["prediction_rank_desc"] = board.groupby("prediction_session")["score_z"].rank(method="dense", ascending=False)
-    board["confidence_rank_desc"] = board.groupby("prediction_session")["confidence_score"].rank(method="dense", ascending=False)
+    board["confidence_rank_desc"] = board.groupby("prediction_session")["confidence_proxy"].rank(method="dense", ascending=False)
     board["edge_rank_desc"] = board.groupby("prediction_session")["score_plain"].transform(
         lambda series: series.abs().rank(method="dense", ascending=False)
     )
@@ -116,7 +116,7 @@ def build_prediction_board(
         "score_plain",
         "score_z",
         "score_risk",
-        "confidence_score",
+        "confidence_proxy",
         "alpha_uncertainty",
         "beta_used",
         "beta_mode",
@@ -192,11 +192,11 @@ def build_prediction_board(
                 "top_longs": " | ".join(f"{row.ticker}:{row.score_z:.3f}" for row in longs.itertuples(index=False)),
                 "top_shorts": " | ".join(f"{row.ticker}:{row.score_z:.3f}" for row in shorts.itertuples(index=False)),
                 "highest_confidence_ticker": (
-                    session_frame.sort_values(["confidence_score", "ticker"], ascending=[False, True]).iloc[0]["ticker"]
+                    session_frame.sort_values(["confidence_proxy", "ticker"], ascending=[False, True]).iloc[0]["ticker"]
                     if not session_frame.empty
                     else ""
                 ),
-                "highest_confidence_score": float(session_frame["confidence_score"].max()) if not session_frame.empty else float("nan"),
+                "highest_confidence_proxy": float(session_frame["confidence_proxy"].max()) if not session_frame.empty else float("nan"),
                 "mixed_signal_sessions": bool(session_frame["signal_session"].nunique() > 1),
             }
         )
@@ -306,6 +306,10 @@ def build_live_report_boards(
     files = {
         "live_scoreboard_positions": "live_scoreboard_positions.csv",
         "live_scoreboard_daily": "live_scoreboard_daily.csv",
+        "live_winner_positions": "live_winner_positions.csv",
+        "live_winner_daily_summary": "live_winner_daily_summary.csv",
+        "live_winner_backtest_summary": "live_winner_backtest_summary.csv",
+        "live_winner_rank_ic": "live_winner_rank_ic.csv",
         "live_execution_position_returns": "live_execution_position_returns.csv",
         "live_execution_daily_returns": "live_execution_daily_returns.csv",
         "live_metrics_summary": "live_metrics_summary.csv",
@@ -322,6 +326,8 @@ def build_live_report_boards(
     for name in [
         "live_scoreboard_positions",
         "live_scoreboard_daily",
+        "live_winner_positions",
+        "live_winner_daily_summary",
         "live_execution_position_returns",
         "live_execution_daily_returns",
         "prediction_summary_history",
@@ -370,6 +376,20 @@ def build_live_report_boards(
             .sort_values(["prediction_session"])
             .reset_index(drop=True)
         )
+    if "live_winner_positions" in frames:
+        frames["live_winner_positions_current"] = (
+            frames["live_winner_positions"]
+            .loc[frames["live_winner_positions"]["prediction_session"] == prediction_session]
+            .sort_values(["rank", "ticker"])
+            .reset_index(drop=True)
+        )
+    if "live_winner_daily_summary" in frames:
+        frames["live_winner_daily_summary_current"] = (
+            frames["live_winner_daily_summary"]
+            .loc[frames["live_winner_daily_summary"]["prediction_session"] == prediction_session]
+            .sort_values(["prediction_session"])
+            .reset_index(drop=True)
+        )
     return frames
 
 
@@ -394,6 +414,77 @@ def _summary_metric(
     if match.empty:
         return float("nan")
     return _float_or_nan(match.iloc[0][column])
+
+
+def _detect_product_mode(
+    *,
+    prediction_summary: pd.DataFrame | None = None,
+    forecasts: pd.DataFrame | None = None,
+) -> str:
+    for frame in [prediction_summary, forecasts]:
+        if frame is None or frame.empty or "product_mode" not in frame.columns:
+            continue
+        values = frame["product_mode"].dropna()
+        if not values.empty:
+            return str(values.iloc[0])
+    return "ranker"
+
+
+def _build_winner_paper_summary(
+    *,
+    prediction_summary: pd.DataFrame,
+    winner_board: pd.DataFrame,
+    winner_top_picks: pd.DataFrame,
+    winner_daily_summary: pd.DataFrame,
+    live_boards: dict[str, pd.DataFrame],
+    backtest_boards: dict[str, pd.DataFrame],
+    report_mode: str,
+    report_context: dict[str, object] | None,
+) -> pd.DataFrame:
+    report_context = report_context or {}
+    summary_row = prediction_summary.iloc[0].to_dict() if not prediction_summary.empty else {}
+    daily_row = winner_daily_summary.iloc[0].to_dict() if not winner_daily_summary.empty else {}
+    paper_summary: dict[str, object] = {
+        "report_generated_utc": pd.Timestamp.utcnow(),
+        "report_mode": report_mode,
+        "product_mode": "winner_picker",
+        "prediction_dir": str(report_context.get("prediction_dir", "")),
+        "analysis_dir": str(report_context.get("analysis_dir", "")),
+        "ledger_dir": str(report_context.get("ledger_dir", "")),
+        "reconciliation_status": report_context.get("reconciliation_status", "unknown"),
+        "reconciliation_message": report_context.get("reconciliation_message", ""),
+        **summary_row,
+        **daily_row,
+    }
+    if not winner_board.empty:
+        paper_summary["n_forecasts"] = int(len(winner_board))
+        paper_summary["winner_board_top_ticker"] = str(
+            winner_board.sort_values(["winner_score", "ticker"], ascending=[False, True]).iloc[0]["ticker"]
+        )
+        paper_summary["winner_board_top_confidence_ticker"] = str(
+            winner_board.sort_values(["confidence_proxy", "ticker"], ascending=[False, True]).iloc[0]["ticker"]
+        )
+    if not winner_top_picks.empty:
+        paper_summary["n_selected"] = int(len(winner_top_picks))
+        paper_summary["selected_tickers"] = " | ".join(winner_top_picks.sort_values(["rank", "ticker"])["ticker"].astype(str).tolist())
+    live_current = live_boards.get("live_winner_daily_summary_current", pd.DataFrame())
+    if not live_current.empty:
+        live_row = live_current.iloc[0]
+        paper_summary["live_current_available"] = True
+        paper_summary["live_current_gross_return"] = _float_or_nan(live_row.get("gross_return"))
+        paper_summary["live_current_mean_selected_return"] = _float_or_nan(live_row.get("mean_selected_return"))
+        paper_summary["live_current_mean_selected_alpha"] = _float_or_nan(live_row.get("mean_selected_alpha"))
+    else:
+        paper_summary["live_current_available"] = False
+    live_summary = live_boards.get("live_winner_backtest_summary", pd.DataFrame())
+    if not live_summary.empty:
+        for column in live_summary.columns:
+            paper_summary[f"live_{column}"] = live_summary.iloc[0][column]
+    backtest_summary = backtest_boards.get("winner_backtest_summary", pd.DataFrame())
+    if not backtest_summary.empty:
+        for column in backtest_summary.columns:
+            paper_summary[f"backtest_{column}"] = backtest_summary.iloc[0][column]
+    return pd.DataFrame([paper_summary])
 
 
 def _build_paper_summary(
@@ -624,10 +715,10 @@ def _write_report_charts(
         _write_bar_chart(
             confidence_chart,
             labels=ordered_book["ticker"].tolist(),
-            values=ordered_book["confidence_score"].astype(float).tolist(),
+            values=ordered_book["confidence_proxy"].astype(float).tolist(),
             colors=["#1f77b4"] * len(ordered_book),
             title="Current Book Confidence",
-            ylabel="confidence_score",
+            ylabel="confidence_proxy",
         )
         chart_rows.append(
             {
@@ -668,12 +759,12 @@ def _write_report_charts(
         _write_scatter_chart(
             universe_chart,
             x_values=ordered_universe["score_plain"].astype(float).tolist(),
-            y_values=ordered_universe["confidence_score"].astype(float).tolist(),
+            y_values=ordered_universe["confidence_proxy"].astype(float).tolist(),
             labels=ordered_universe["ticker"].astype(str).tolist(),
             colors=["#ff8c00" if selected else "#4f81bd" for selected in ordered_universe["in_book"]],
             title="Predicted Edge Versus Confidence",
             xlabel="score_plain",
-            ylabel="confidence_score",
+            ylabel="confidence_proxy",
         )
         chart_rows.append(
             {
@@ -778,6 +869,296 @@ def _write_report_charts(
     return charts
 
 
+def _write_winner_report_charts(
+    output_dir: Path,
+    *,
+    winner_board: pd.DataFrame,
+    winner_top_picks: pd.DataFrame,
+    live_boards: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    charts_dir = output_dir / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+
+    chart_rows: list[dict[str, str]] = []
+    if not winner_top_picks.empty:
+        ordered_picks = winner_top_picks.sort_values(["rank", "ticker"]).reset_index(drop=True)
+        score_chart = charts_dir / "winner_top_picks_score.png"
+        _write_bar_chart(
+            score_chart,
+            labels=ordered_picks["ticker"].astype(str).tolist(),
+            values=ordered_picks["winner_score"].astype(float).tolist(),
+            colors=["#2e8b57"] * len(ordered_picks),
+            title="Winner Top Picks",
+            ylabel="winner_score",
+        )
+        chart_rows.append(
+            {
+                "chart_key": "winner_top_picks_score",
+                "title": "Winner Top Picks",
+                "description": "Selected winner-mode longs ranked by winner_score.",
+                "relative_path": str(score_chart.relative_to(output_dir)).replace("\\", "/"),
+            }
+        )
+
+    if not winner_board.empty:
+        scatter_chart = charts_dir / "winner_board_alpha_vs_confidence.png"
+        ordered_board = winner_board.sort_values(["winner_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
+        _write_scatter_chart(
+            scatter_chart,
+            x_values=ordered_board["pred_alpha_1d"].astype(float).tolist(),
+            y_values=ordered_board["confidence_proxy"].astype(float).tolist(),
+            labels=ordered_board["ticker"].astype(str).tolist(),
+            colors=["#ff8c00" if bool(selected) else "#4f81bd" for selected in ordered_board.get("selected", pd.Series(False, index=ordered_board.index))],
+            title="Predicted Alpha Versus Confidence Proxy",
+            xlabel="pred_alpha_1d",
+            ylabel="confidence_proxy",
+        )
+        chart_rows.append(
+            {
+                "chart_key": "winner_board_alpha_vs_confidence",
+                "title": "Predicted Alpha Versus Confidence Proxy",
+                "description": "Orange names are selected winners. Blue names were forecasted but not selected.",
+                "relative_path": str(scatter_chart.relative_to(output_dir)).replace("\\", "/"),
+            }
+        )
+
+    live_positions = live_boards.get("live_winner_positions_current", pd.DataFrame())
+    if not live_positions.empty:
+        realized_chart = charts_dir / "winner_predicted_vs_realized_alpha.png"
+        _write_scatter_chart(
+            realized_chart,
+            x_values=live_positions["pred_alpha_1d"].astype(float).tolist(),
+            y_values=live_positions["realized_alpha_1d"].astype(float).tolist(),
+            labels=live_positions["ticker"].astype(str).tolist(),
+            colors=["#2e8b57"] * len(live_positions),
+            title="Winner Predicted Versus Realized Alpha",
+            xlabel="pred_alpha_1d",
+            ylabel="realized_alpha_1d",
+        )
+        chart_rows.append(
+            {
+                "chart_key": "winner_predicted_vs_realized_alpha",
+                "title": "Winner Predicted Versus Realized Alpha",
+                "description": "Available once the predicted session has been reconciled.",
+                "relative_path": str(realized_chart.relative_to(output_dir)).replace("\\", "/"),
+            }
+        )
+
+    charts = pd.DataFrame.from_records(chart_rows)
+    if not charts.empty:
+        charts.to_csv(output_dir / "chart_manifest.csv", index=False)
+    return charts
+
+
+def _render_winner_report_html(
+    output_dir: Path,
+    *,
+    paper_summary: pd.DataFrame,
+    prediction_summary: pd.DataFrame,
+    winner_board: pd.DataFrame,
+    winner_top_picks: pd.DataFrame,
+    winner_daily_summary: pd.DataFrame,
+    live_boards: dict[str, pd.DataFrame],
+    backtest_boards: dict[str, pd.DataFrame],
+    charts: pd.DataFrame,
+) -> None:
+    summary_cards: list[str] = []
+    if not paper_summary.empty:
+        row = paper_summary.iloc[0]
+        for label, value in [
+            ("Mode", row.get("report_mode", "")),
+            ("Prediction Date", row.get("prediction_session", "")),
+            ("Forecasted Names", row.get("n_forecasts", "")),
+            ("Selected Winners", row.get("n_selected", "")),
+            ("Model", row.get("model_id", "")),
+            ("Context", row.get("context_length", "")),
+            ("Basket Mode", row.get("basket_mode", "")),
+            ("Beta Mode", row.get("beta_mode", "")),
+            ("Confirmation", row.get("confirmation_mode", "")),
+            ("Reconciliation", row.get("reconciliation_status", "")),
+        ]:
+            summary_cards.append(
+                "<div class='card'><div class='label'>{}</div><div class='value'>{}</div></div>".format(
+                    html.escape(str(label)),
+                    html.escape(str(value)),
+                )
+            )
+
+    chart_html = ""
+    if not charts.empty:
+        parts: list[str] = []
+        for row in charts.itertuples(index=False):
+            parts.append(
+                "<div class='chart-block'><h3>{}</h3><p class='muted'>{}</p><img src='{}' alt='{}'></div>".format(
+                    html.escape(str(row.title)),
+                    html.escape(str(row.description)),
+                    html.escape(str(row.relative_path)),
+                    html.escape(str(row.title)),
+                )
+            )
+        chart_html = "\n".join(parts)
+    else:
+        chart_html = "<p class='muted'>No charts were generated for this package.</p>"
+
+    live_positions = live_boards.get("live_winner_positions_current", pd.DataFrame())
+    live_daily = live_boards.get("live_winner_daily_summary_current", pd.DataFrame())
+    live_summary = live_boards.get("live_winner_backtest_summary", pd.DataFrame())
+    backtest_summary = backtest_boards.get("winner_backtest_summary", pd.DataFrame())
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Chronos Winner Report</title>
+  <style>
+    body {{
+      font-family: Segoe UI, Arial, sans-serif;
+      margin: 24px;
+      color: #1f2933;
+      background: #f8fafc;
+    }}
+    h1, h2, h3 {{
+      color: #102a43;
+    }}
+    .muted {{
+      color: #52606d;
+    }}
+    .cards {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin: 16px 0 24px;
+    }}
+    .card {{
+      background: white;
+      border: 1px solid #d9e2ec;
+      border-radius: 10px;
+      padding: 12px 14px;
+      box-shadow: 0 1px 2px rgba(16, 42, 67, 0.08);
+    }}
+    .card .label {{
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #7b8794;
+      margin-bottom: 6px;
+    }}
+    .card .value {{
+      font-size: 18px;
+      font-weight: 600;
+      word-break: break-word;
+    }}
+    .chronos-table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 20px;
+      background: white;
+      font-size: 13px;
+    }}
+    .chronos-table th, .chronos-table td {{
+      border: 1px solid #d9e2ec;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .chronos-table th {{
+      background: #f0f4f8;
+    }}
+    .chart-block {{
+      background: white;
+      border: 1px solid #d9e2ec;
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin: 12px 0 18px;
+    }}
+    .chart-block img {{
+      max-width: 100%;
+      border-radius: 6px;
+      border: 1px solid #d9e2ec;
+      background: white;
+    }}
+  </style>
+</head>
+<body>
+  <h1>Chronos Winner Picker Report</h1>
+  <p class="muted">This package focuses on the additive winner-picker mode built on the locked Chronos-2 V2 core.</p>
+
+  <h2>Overview</h2>
+  <div class="cards">
+    {''.join(summary_cards)}
+  </div>
+
+  <h2>Prediction Summary</h2>
+  {_html_table(prediction_summary)}
+
+  <h2>Winner Top Picks</h2>
+  {_html_table(winner_top_picks)}
+
+  <h2>Winner Board</h2>
+  {_html_table(winner_board)}
+
+  <h2>Daily Winner Summary</h2>
+  {_html_table(winner_daily_summary)}
+
+  <h2>Charts</h2>
+  {chart_html}
+
+  <h2>Live Reconciliation</h2>
+  {_html_table(live_daily)}
+  {_html_table(live_positions)}
+  {_html_table(live_summary)}
+
+  <h2>Historical Winner Snapshot</h2>
+  {_html_table(backtest_summary)}
+</body>
+</html>
+"""
+    (output_dir / "paper_report.html").write_text(html_body, encoding="utf-8")
+
+
+def _write_winner_notes(
+    output_dir: Path,
+    *,
+    ledger_dir: Path | None = None,
+    analysis_dir: Path | None = None,
+) -> None:
+    lines = [
+        "Chronos winner-picker package guide",
+        "",
+        "winner_board.csv",
+        "One row per forecasted ticker with winner-mode metrics such as pred_ret_1d, pred_alpha_1d, confidence_proxy, winner_score, and signal_label.",
+        "",
+        "winner_top_picks.csv",
+        "Only the selected BUY and BUY_STRONG names ranked by winner_score.",
+        "",
+        "winner_daily_summary.csv",
+        "One row per prediction day showing how many names were eligible, confirmed, and actually selected. Zero-pick days remain valid rows.",
+        "",
+        "confidence_proxy",
+        "This is a heuristic strength ratio, not a calibrated probability.",
+        "",
+    ]
+    if ledger_dir is not None:
+        lines.extend(
+            [
+                "live_winner_positions.csv",
+                "Ticker-level realized winner positions after reconciliation.",
+                "",
+                "live_winner_daily_summary.csv",
+                "Daily realized winner-book summary after reconciliation.",
+                "",
+            ]
+        )
+    if analysis_dir is not None:
+        lines.extend(
+            [
+                "winner_backtest_summary.csv",
+                "Historical long-only winner summary from the frozen winner-mode run.",
+                "",
+            ]
+        )
+    (output_dir / "README.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
 def _render_paper_report_html(
     output_dir: Path,
     *,
@@ -844,7 +1225,7 @@ def _render_paper_report_html(
         "score_plain",
         "score_z",
         "score_risk",
-        "confidence_score",
+        "confidence_proxy",
         "beta_used",
         "alpha_uncertainty",
         "alpha_q50_path_text",
@@ -857,7 +1238,7 @@ def _render_paper_report_html(
         "confidence_rank_desc",
         "score_plain",
         "score_z",
-        "confidence_score",
+        "confidence_proxy",
         "predicted_direction",
     ]
     live_position_columns = [
@@ -1020,7 +1401,7 @@ def write_chronos_notes(
         "Single-file visual report that summarizes the current prediction, optional live reconciliation, and optional historical backtest reference.",
         "",
         "prediction_board.csv",
-        "One row per forecasted ticker with explicit signal_session and prediction_session, plus score_plain, score_z, confidence_score, and in_book flag.",
+        "One row per forecasted ticker with explicit signal_session and prediction_session, plus score_plain, score_z, confidence_proxy, and in_book flag.",
         "",
         "prediction_slot_board.csv",
         "One row per ticker per forecast slot. Use this to see the path the model predicted across the next session.",
@@ -1029,11 +1410,11 @@ def write_chronos_notes(
         "One row per prediction_session with top longs, top shorts, confidence leader, and warnings about mixed sessions.",
         "",
         "Confidence definition",
-        "confidence_score = abs(score_plain) / alpha_uncertainty. Higher means the predicted edge is large relative to the forecast interval width.",
+        "confidence_proxy = abs(score_plain) / alpha_uncertainty. Higher means the predicted edge is large relative to the forecast interval width.",
         "",
         "Rank fields",
         "prediction_rank_desc ranks score_z from strongest to weakest within each prediction_session.",
-        "confidence_rank_desc ranks confidence_score within each prediction_session.",
+        "confidence_rank_desc ranks confidence_proxy within each prediction_session.",
         "",
     ]
     if ledger_dir is not None:
@@ -1093,14 +1474,15 @@ def export_chronos_package(
         forecasts = pd.DataFrame(json.load(handle))
     book = pd.read_csv(prediction_dir / "book.csv")
     prediction_summary = pd.read_csv(prediction_dir / "prediction_summary.csv")
-    prediction_board, prediction_slot_board, prediction_summary_board = build_prediction_board(
-        forecasts,
-        book,
-        prediction_summary,
-    )
+    product_mode = _detect_product_mode(prediction_summary=prediction_summary, forecasts=forecasts)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if (prediction_dir / "data_quality_events.csv").exists():
+        pd.read_csv(prediction_dir / "data_quality_events.csv").to_csv(output_dir / "prediction_data_quality_events.csv", index=False)
+
     normalized_prediction_summary = normalize_time_columns(
         prediction_summary,
-        ["signal_session", "prediction_session", "generated_at_utc"],
+        ["signal_session", "prediction_session", "prediction_session_end", "generated_at_utc"],
     )
     if not normalized_prediction_summary.empty and "prediction_session" in normalized_prediction_summary.columns:
         prediction_session = pd.to_datetime(
@@ -1109,18 +1491,98 @@ def export_chronos_package(
             errors="coerce",
         ).max()
     else:
+        prediction_session = None
+
+    if product_mode == "winner_picker":
+        winner_board_path = prediction_dir / "winner_board.csv"
+        winner_top_picks_path = prediction_dir / "winner_top_picks.csv"
+        winner_daily_summary_path = prediction_dir / "winner_daily_summary.csv"
+        winner_daily_positions_path = prediction_dir / "winner_daily_positions.csv"
+
+        winner_board = pd.read_csv(winner_board_path) if winner_board_path.exists() else pd.DataFrame()
+        winner_top_picks = pd.read_csv(winner_top_picks_path) if winner_top_picks_path.exists() else pd.DataFrame()
+        winner_daily_summary = pd.read_csv(winner_daily_summary_path) if winner_daily_summary_path.exists() else pd.DataFrame()
+        winner_daily_positions = pd.read_csv(winner_daily_positions_path) if winner_daily_positions_path.exists() else pd.DataFrame()
+
+        prediction_summary.to_csv(output_dir / "prediction_summary.csv", index=False)
+        winner_board.to_csv(output_dir / "winner_board.csv", index=False)
+        winner_top_picks.to_csv(output_dir / "winner_top_picks.csv", index=False)
+        winner_daily_summary.to_csv(output_dir / "winner_daily_summary.csv", index=False)
+        winner_daily_positions.to_csv(output_dir / "winner_daily_positions.csv", index=False)
+
+        live_boards = build_live_report_boards(ledger_dir, prediction_session=prediction_session) if ledger_dir is not None else {}
+        for name in [
+            "live_winner_positions",
+            "live_winner_positions_current",
+            "live_winner_daily_summary",
+            "live_winner_daily_summary_current",
+            "live_winner_backtest_summary",
+            "live_winner_rank_ic",
+            "reconciliation_summary",
+            "prediction_summary_history",
+        ]:
+            frame = live_boards.get(name)
+            if frame is not None and not frame.empty:
+                frame.to_csv(output_dir / f"{name}.csv", index=False)
+
+        backtest_boards: dict[str, pd.DataFrame] = {}
+        if analysis_dir is not None:
+            for filename in ["winner_backtest_summary.csv"]:
+                source = analysis_dir / filename
+                if source.exists():
+                    frame = pd.read_csv(source)
+                    backtest_boards[filename.replace(".csv", "")] = frame
+                    frame.to_csv(output_dir / filename, index=False)
+
+        paper_summary = _build_winner_paper_summary(
+            prediction_summary=prediction_summary,
+            winner_board=winner_board,
+            winner_top_picks=winner_top_picks,
+            winner_daily_summary=winner_daily_summary,
+            live_boards=live_boards,
+            backtest_boards=backtest_boards,
+            report_mode=report_mode,
+            report_context=report_context,
+        )
+        paper_summary.to_csv(output_dir / "paper_summary.csv", index=False)
+        charts = _write_winner_report_charts(
+            output_dir,
+            winner_board=winner_board,
+            winner_top_picks=winner_top_picks,
+            live_boards=live_boards,
+        )
+        _render_winner_report_html(
+            output_dir,
+            paper_summary=paper_summary,
+            prediction_summary=prediction_summary,
+            winner_board=winner_board,
+            winner_top_picks=winner_top_picks,
+            winner_daily_summary=winner_daily_summary,
+            live_boards=live_boards,
+            backtest_boards=backtest_boards,
+            charts=charts,
+        )
+        _write_winner_notes(
+            output_dir,
+            ledger_dir=ledger_dir,
+            analysis_dir=analysis_dir,
+        )
+        return
+
+    prediction_board, prediction_slot_board, prediction_summary_board = build_prediction_board(
+        forecasts,
+        book,
+        prediction_summary,
+    )
+    if prediction_session is None:
         prediction_session = (
             pd.to_datetime(prediction_summary_board["prediction_session"], utc=True, errors="coerce").max()
             if not prediction_summary_board.empty
             else None
         )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
     prediction_board.to_csv(output_dir / "prediction_board.csv", index=False)
     prediction_slot_board.to_csv(output_dir / "prediction_slot_board.csv", index=False)
     prediction_summary_board.to_csv(output_dir / "prediction_summary_board.csv", index=False)
-    if (prediction_dir / "data_quality_events.csv").exists():
-        pd.read_csv(prediction_dir / "data_quality_events.csv").to_csv(output_dir / "prediction_data_quality_events.csv", index=False)
 
     live_boards = build_live_report_boards(ledger_dir, prediction_session=prediction_session) if ledger_dir is not None else {}
     for name in [

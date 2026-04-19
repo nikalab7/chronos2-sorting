@@ -41,8 +41,13 @@ US_MARKET_BUSINESS_DAY = CustomBusinessDay(calendar=USMarketHolidayCalendar())
 @dataclass
 class ChronosTaskBuilder:
     benchmark_ticker: str = "SPY"
-    past_only_covariates: tuple[str, ...] = ("log_volume", "high_low_range", "realized_vol_20", "spy_same_slot_return")
+    past_only_covariates: tuple[str, ...] = ("log_volume", "high_low_range", "rolling_slot_vol_20", "spy_same_slot_return")
     known_future_covariates: tuple[str, ...] = ("slot_id", "weekday", "month_end_flag")
+    legacy_covariate_aliases: dict[str, str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.legacy_covariate_aliases is None:
+            self.legacy_covariate_aliases = {"rolling_slot_vol_20": "realized_vol_20"}
 
     @staticmethod
     def next_trading_session(session_date: pd.Timestamp) -> pd.Timestamp:
@@ -72,7 +77,12 @@ class ChronosTaskBuilder:
 
         if use_covariates:
             for name in self.past_only_covariates + self.known_future_covariates:
-                past_covariates[name] = history_tail[name].to_numpy(dtype=float)
+                source_name = name
+                if source_name not in history_tail.columns and source_name in self.legacy_covariate_aliases:
+                    legacy_name = self.legacy_covariate_aliases[source_name]
+                    if legacy_name in history_tail.columns:
+                        source_name = legacy_name
+                past_covariates[name] = history_tail[source_name].to_numpy(dtype=float)
             if future is not None:
                 for name in self.known_future_covariates:
                     future_covariates[name] = future[name].to_numpy(dtype=float)

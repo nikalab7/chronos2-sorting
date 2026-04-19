@@ -263,6 +263,31 @@ class LiveReconciliationTests(unittest.TestCase):
             self.assertIn("score_z", scoreboard_positions.columns)
             self.assertIn("execution_mode", execution_summary.columns)
             self.assertIn("net_sharpe_10bps", execution_summary.columns)
+            exact_open = execution_summary.loc[execution_summary["execution_mode"] == "exact_open"].iloc[0]
+            self.assertAlmostEqual(
+                float(exact_open["mean_daily_long_short_spread"]),
+                2.0 * float(exact_open["mean_daily_gross_return"]),
+            )
+
+    def test_reconcile_live_prediction_blocks_future_realized_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prediction_dir = self._write_prediction_dir(root)
+            ledger_dir = root / "ledger"
+
+            pipeline = ZeroShotResearchPipeline(
+                provider=_FakeYahooProvider(),
+                research_config=ResearchConfig(),
+            )
+
+            with self.assertRaisesRegex(ValueError, "still in the future"):
+                pipeline.reconcile_live_prediction(
+                    prediction_dir=prediction_dir,
+                    ledger_dir=ledger_dir,
+                    execution_interval="5m",
+                    execution_mode="strict",
+                    now=pd.Timestamp("2026-04-15 18:00:00", tz="America/New_York"),
+                )
 
 
 if __name__ == "__main__":

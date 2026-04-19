@@ -52,6 +52,7 @@ class ExperimentResult:
     rank_ic_summary: pd.DataFrame
     data_quality_events: pd.DataFrame = field(default_factory=pd.DataFrame)
     data_quality_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    extra_outputs: dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -62,3 +63,4 @@ class LivePredictionResult:
     prediction_summary: pd.DataFrame
     data_quality_events: pd.DataFrame = field(default_factory=pd.DataFrame)
     data_quality_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    extra_outputs: dict[str, pd.DataFrame] = field(default_factory=dict)

@@ -34,7 +34,7 @@ class LabelBuilder:
         labeled["weekday"] = labeled["session_date"].dt.weekday.astype(float)
         labeled["month_end_flag"] = labeled["session_date"].dt.is_month_end.astype(float)
         labeled["spy_same_slot_return"] = labeled["benchmark_slot_return"]
-        labeled["realized_vol_20"] = (
+        labeled["rolling_slot_vol_20"] = (
             labeled.groupby("ticker")["slot_log_return"].transform(
                 lambda series: series.rolling(self.realized_vol_window, min_periods=5).std()
             )

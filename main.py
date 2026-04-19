@@ -15,10 +15,13 @@ if str(SRC) not in sys.path:
 
 from chronos_equity_prototype.config import (  # noqa: E402
     DEFAULT_LIQUID_SP500,
+    DEFAULT_PRODUCT_MODE,
     DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS,
     DEFAULT_V2_BETA_MODE,
     DEFAULT_V2_BOOK_MODE,
     DEFAULT_V2_TAIL_FRACTION,
+    DEFAULT_WINNER_CONFIRMATION_MODES,
+    DEFAULT_WINNER_CONFIRMATION_MODE,
     ForecasterConfig,
     ResearchConfig,
 )
@@ -92,8 +95,19 @@ def _resolve_context_length(args: argparse.Namespace) -> int:
 def _build_experiment_name(args: argparse.Namespace, context_length: int) -> str:
     model_slug = _model_slug(args.model_id)
     if args.architecture == "v2_flagship_basket_raw":
+        if getattr(args, "product_mode", DEFAULT_PRODUCT_MODE) == "winner_picker":
+            return (
+                f"{args.architecture}_{args.basket_mode}_{args.product_mode}_{model_slug}_ctx{context_length}_"
+                f"confirm{args.confirmation_mode}_cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}_"
+                f"beta{args.beta_mode}"
+            )
         return (
             f"{args.architecture}_{args.basket_mode}_{model_slug}_ctx{context_length}_"
+            f"cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}"
+        )
+    if getattr(args, "product_mode", DEFAULT_PRODUCT_MODE) != "ranker":
+        return (
+            f"{args.architecture}_{args.product_mode}_{model_slug}_ctx{context_length}_"
             f"cross{int(args.cross_learning)}_cov{int(not args.no_covariates)}"
         )
     return (
@@ -104,9 +118,14 @@ def _build_experiment_name(args: argparse.Namespace, context_length: int) -> str
 
 def _build_pipeline(args: argparse.Namespace, tickers: list[str]) -> tuple[ZeroShotResearchPipeline, int]:
     resolved_context_length = _resolve_context_length(args)
+    research_defaults = ResearchConfig()
     research_config = ResearchConfig(
         model_id=args.model_id,
-        prediction_length=args.prediction_length,
+        prediction_length=(
+            research_defaults.winner_prediction_length
+            if getattr(args, "product_mode", DEFAULT_PRODUCT_MODE) == "winner_picker"
+            else args.prediction_length
+        ),
         default_context_length=resolved_context_length,
         benchmark_ticker=args.benchmark.upper(),
         batch_size=args.batch_size,
@@ -118,15 +137,19 @@ def _build_pipeline(args: argparse.Namespace, tickers: list[str]) -> tuple[ZeroS
 
 
 def _build_forecaster_config(args: argparse.Namespace, context_length: int) -> ForecasterConfig:
+    defaults = ResearchConfig()
+    product_mode = getattr(args, "product_mode", DEFAULT_PRODUCT_MODE)
     return ForecasterConfig(
         model_id=args.model_id,
-        prediction_length=args.prediction_length,
+        prediction_length=defaults.winner_prediction_length if product_mode == "winner_picker" else args.prediction_length,
         context_length=context_length,
-        quantiles=(0.1, 0.5, 0.9),
+        quantiles=defaults.winner_quantiles if product_mode == "winner_picker" else defaults.quantiles,
         cross_learning=args.cross_learning,
         use_covariates=not args.no_covariates,
         batch_size=args.batch_size,
         beta_mode=args.beta_mode,
+        product_mode=product_mode,
+        confirmation_mode=getattr(args, "confirmation_mode", DEFAULT_WINNER_CONFIRMATION_MODE),
     )
 
 
@@ -134,12 +157,7 @@ def _print_live_summary(prediction_dir: Path, report_dir: Path, reconcile_status
     summary = pd.read_csv(prediction_dir / "prediction_summary.csv")
     book = pd.read_csv(prediction_dir / "book.csv")
     summary_row = summary.iloc[0]
-    preview_columns = [
-        column
-        for column in ["side", "rank", "ticker", "basket_id", "score_plain", "score_z", "score_q50"]
-        if column in book.columns
-    ]
-    preview = book[preview_columns].sort_values(["side", "rank", "ticker"])
+    product_mode = str(summary_row.get("product_mode", "ranker"))
 
     print()
     print("Live prediction summary")
@@ -159,7 +177,44 @@ def _print_live_summary(prediction_dir: Path, report_dir: Path, reconcile_status
     if reconcile_message:
         print(f"  Reconcile note:     {reconcile_message}")
     print()
-    print(preview.to_string(index=False))
+    if product_mode == "winner_picker":
+        winner_top_picks_path = prediction_dir / "winner_top_picks.csv"
+        winner_board_path = prediction_dir / "winner_board.csv"
+        preview = pd.read_csv(winner_top_picks_path) if winner_top_picks_path.exists() else pd.DataFrame()
+        if preview.empty and winner_board_path.exists():
+            preview = pd.read_csv(winner_board_path).head(12)
+        preview_columns = [
+            column
+            for column in [
+                "rank",
+                "ticker",
+                "basket_id",
+                "winner_score",
+                "pred_ret_1d",
+                "pred_alpha_1d",
+                "pred_ret_3d",
+                "pred_alpha_3d",
+                "confidence_proxy",
+                "signal_label",
+            ]
+            if column in preview.columns
+        ]
+        if preview.empty:
+            winner_daily_summary_path = prediction_dir / "winner_daily_summary.csv"
+            if winner_daily_summary_path.exists():
+                print(pd.read_csv(winner_daily_summary_path).to_string(index=False))
+            else:
+                print("No winner-mode candidates were written.")
+        else:
+            print(preview[preview_columns].to_string(index=False))
+    else:
+        preview_columns = [
+            column
+            for column in ["side", "rank", "ticker", "basket_id", "score_plain", "score_z"]
+            if column in book.columns
+        ]
+        preview = book[preview_columns].sort_values(["side", "rank", "ticker"])
+        print(preview.to_string(index=False))
     print()
     print(f"Prediction files: {prediction_dir}")
     print(f"Paper report:     {report_dir / 'paper_report.html'}")
@@ -193,10 +248,17 @@ def _print_dataframe(frame: pd.DataFrame, *, columns: list[str] | None = None, m
 def _print_terminal_report(report_dir: Path) -> None:
     paper_summary = _read_csv_if_exists(report_dir / "paper_summary.csv")
     prediction_board = _read_csv_if_exists(report_dir / "prediction_board.csv")
+    winner_board = _read_csv_if_exists(report_dir / "winner_board.csv")
+    winner_top_picks = _read_csv_if_exists(report_dir / "winner_top_picks.csv")
+    winner_daily_summary = _read_csv_if_exists(report_dir / "winner_daily_summary.csv")
+    live_winner_positions = _read_csv_if_exists(report_dir / "live_winner_positions.csv")
+    live_winner_daily_summary = _read_csv_if_exists(report_dir / "live_winner_daily_summary.csv")
+    live_winner_backtest_summary = _read_csv_if_exists(report_dir / "live_winner_backtest_summary.csv")
     live_current_day_positions = _read_csv_if_exists(report_dir / "live_current_day_positions.csv")
     live_current_day_daily = _read_csv_if_exists(report_dir / "live_current_day_daily.csv")
     live_metrics_summary = _read_csv_if_exists(report_dir / "live_metrics_summary.csv")
     backtest_overview = _read_csv_if_exists(report_dir / "backtest_overview.csv")
+    winner_backtest_summary = _read_csv_if_exists(report_dir / "winner_backtest_summary.csv")
     has_detailed_backtest_tables = any(
         (report_dir / filename).exists()
         for filename in [
@@ -224,6 +286,56 @@ def _print_terminal_report(report_dir: Path) -> None:
             print(f"Prediction freshness:   {row.get('prediction_freshness', '')}")
         print(f"Reconciliation status:  {row.get('reconciliation_status', '')}")
 
+    if not winner_board.empty:
+        _print_section("Winner Board")
+        _print_dataframe(
+            winner_board.sort_values(["winner_score", "ticker"], ascending=[False, True]),
+            columns=[
+                "ticker",
+                "basket_id",
+                "winner_score",
+                "pred_ret_1d",
+                "pred_alpha_1d",
+                "pred_ret_3d",
+                "pred_alpha_3d",
+                "confidence_proxy",
+                "signal_label",
+                "buy_eligible",
+                "confirmed_3d",
+            ],
+        )
+
+    if not winner_top_picks.empty:
+        _print_section("Winner Top Picks")
+        _print_dataframe(
+            winner_top_picks.sort_values(["rank", "ticker"]),
+            columns=[
+                "rank",
+                "ticker",
+                "basket_id",
+                "winner_score",
+                "pred_ret_1d",
+                "pred_alpha_1d",
+                "confidence_proxy",
+                "signal_label",
+            ],
+        )
+
+    if not winner_daily_summary.empty:
+        _print_section("Winner Daily Summary")
+        _print_dataframe(
+            winner_daily_summary,
+            columns=[
+                "prediction_session",
+                "n_candidates",
+                "n_buy_eligible",
+                "n_confirmed_3d",
+                "n_selected",
+                "book_active",
+                "selected_tickers",
+            ],
+        )
+
     if not prediction_board.empty:
         _print_section("Ticker Forecasts")
         _print_dataframe(
@@ -239,11 +351,48 @@ def _print_terminal_report(report_dir: Path) -> None:
                 "score_plain",
                 "score_z",
                 "score_risk",
-                "confidence_score",
+                "confidence_proxy",
                 "alpha_uncertainty",
                 "predicted_direction",
             ],
         )
+
+    if not live_winner_daily_summary.empty:
+        _print_section("Live Winner Reconciliation")
+        _print_dataframe(
+            live_winner_daily_summary,
+            columns=[
+                "prediction_session",
+                "n_selected",
+                "book_active",
+                "gross_return",
+                "mean_selected_return",
+                "mean_selected_alpha",
+                "best_contributor",
+                "worst_contributor",
+            ],
+        )
+
+    if not live_winner_positions.empty:
+        _print_section("Live Winner Positions")
+        _print_dataframe(
+            live_winner_positions,
+            columns=[
+                "ticker",
+                "rank",
+                "winner_score",
+                "pred_ret_1d",
+                "pred_alpha_1d",
+                "realized_stock_ret_1d",
+                "realized_alpha_1d",
+                "gross_position_return",
+                "book_impact",
+            ],
+        )
+
+    if not live_winner_backtest_summary.empty:
+        _print_section("Live Winner Metrics")
+        _print_dataframe(live_winner_backtest_summary)
 
     if not live_current_day_positions.empty:
         _print_section("Current Realized Positions")
@@ -292,6 +441,10 @@ def _print_terminal_report(report_dir: Path) -> None:
                 "win_rate",
             ],
         )
+
+    if not winner_backtest_summary.empty:
+        _print_section("Winner Backtest Metrics")
+        _print_dataframe(winner_backtest_summary)
 
     if has_detailed_backtest_tables:
         _print_backtest_analysis_tables(report_dir)
@@ -558,6 +711,17 @@ def _print_backtest_analysis_tables(analysis_dir: Path) -> None:
 
 
 def _print_backtest_summary(experiment_dir: Path, analysis_dir: Path | None) -> None:
+    winner_backtest_summary = _read_csv_if_exists(experiment_dir / "winner_backtest_summary.csv")
+    if not winner_backtest_summary.empty:
+        print()
+        print("Winner backtest summary")
+        _print_dataframe(winner_backtest_summary)
+        print()
+        print(f"Experiment files: {experiment_dir}")
+        if analysis_dir is not None:
+            print(f"Analysis files:   {analysis_dir}")
+        return
+
     metrics = pd.read_csv(experiment_dir / "metrics_summary.csv")
     rank_ic = pd.read_csv(experiment_dir / "rank_ic.csv")
     mean_rank_ic = rank_ic.loc[rank_ic["metric"] == "mean_rank_ic", "value"]
@@ -685,6 +849,9 @@ def _run_interactive_menu() -> None:
             default_output = str(_default_output_dir("live"))
             default_analysis = _default_analysis_dir()
             default_ledger = _default_ledger_dir(args.basket_mode)
+            args.product_mode = _prompt_text("Product mode", args.product_mode)
+            if args.product_mode == "winner_picker":
+                args.confirmation_mode = _prompt_text("Winner confirmation mode", args.confirmation_mode)
             args.output_dir = _prompt_text("Output folder", default_output)
             args.analysis_dir = _prompt_text("Frozen backtest analysis folder", default_analysis)
             args.ledger_dir = _prompt_text("Live scoreboard folder", default_ledger)
@@ -692,6 +859,9 @@ def _run_interactive_menu() -> None:
         elif choice == "2":
             args = _interactive_namespace("backtest")
             backtest_start, backtest_end = _default_backtest_window()
+            args.product_mode = _prompt_text("Product mode", args.product_mode)
+            if args.product_mode == "winner_picker":
+                args.confirmation_mode = _prompt_text("Winner confirmation mode", args.confirmation_mode)
             args.output_dir = _prompt_text("Output folder", str(_default_output_dir("backtest")))
             args.start = _prompt_text("Start date", backtest_start)
             args.end = _prompt_text("End date", backtest_end)
@@ -728,6 +898,9 @@ def run_live_mode(args: argparse.Namespace) -> None:
 
     base_tickers = _parse_tickers(args.tickers, args.tickers_file)
     tickers = _resolve_v2_tickers(base_tickers, args.architecture, args.basket_mode)
+    if args.product_mode == "winner_picker" and args.architecture != "v2_flagship_basket_raw":
+        print("winner_picker is supported only with v2_flagship_basket_raw.")
+        return
     pipeline, context_length = _build_pipeline(args, tickers)
     forecaster_config = _build_forecaster_config(args, context_length)
     experiment_name = _build_experiment_name(args, context_length)
@@ -743,14 +916,20 @@ def run_live_mode(args: argparse.Namespace) -> None:
         labeled_frame, v2_base_frame = pipeline.prepare_market_frames(tickers=tickers, start=start, end=end)
         labeled_frame.to_csv(output_dir / "labeled_frame.csv", index=False)
         v2_base_frame.to_csv(output_dir / "v2_base_frame.csv", index=False)
-        result = pipeline.run_v2_next_session_prediction(
-            v2_base_frame,
-            forecaster_config,
-            experiment_name,
-            basket_mode=args.basket_mode,
-            book_mode=args.book_mode,
-            tail_fraction=args.tail_fraction,
-        )
+        try:
+            result = pipeline.run_v2_next_session_prediction(
+                v2_base_frame,
+                forecaster_config,
+                experiment_name,
+                basket_mode=args.basket_mode,
+                book_mode=args.book_mode,
+                tail_fraction=args.tail_fraction,
+            )
+        except ValueError as exc:
+            print()
+            print("Live prediction blocked")
+            print(str(exc))
+            return
     else:
         labeled_frame = pipeline.prepare_labeled_frame(tickers=tickers, start=start, end=end)
         labeled_frame.to_csv(output_dir / "labeled_frame.csv", index=False)
@@ -761,17 +940,39 @@ def run_live_mode(args: argparse.Namespace) -> None:
 
     reconcile_status = "pending"
     reconcile_message = ""
-    try:
-        pipeline.reconcile_live_prediction(
-            prediction_dir=prediction_dir,
-            ledger_dir=ledger_dir,
-            execution_interval=args.execution_interval,
-            execution_mode=args.execution_mode,
+    prediction_sessions: list[pd.Timestamp] = []
+    if not result.prediction_summary.empty and "prediction_session" in result.prediction_summary.columns:
+        prediction_sessions = (
+            pd.to_datetime(result.prediction_summary["prediction_session"], utc=True, errors="coerce")
+            .dropna()
+            .unique()
+            .tolist()
         )
-        reconcile_status = "completed"
-    except Exception as exc:  # pragma: no cover - live data availability can vary by date
-        reconcile_status = "pending"
-        reconcile_message = str(exc)
+    elif not result.book.frame.empty and "prediction_session" in result.book.frame.columns:
+        prediction_sessions = (
+            pd.to_datetime(result.book.frame["prediction_session"], utc=True, errors="coerce")
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+    can_reconcile, reconcile_message = pipeline.reconciliation_readiness(
+        prediction_sessions,
+        market_timezone=pipeline.research_config.market_timezone,
+    )
+    if can_reconcile:
+        try:
+            pipeline.reconcile_live_prediction(
+                prediction_dir=prediction_dir,
+                ledger_dir=ledger_dir,
+                execution_interval=args.execution_interval,
+                execution_mode=args.execution_mode,
+            )
+            reconcile_status = "completed"
+            reconcile_message = ""
+        except Exception as exc:  # pragma: no cover - live data availability can vary by date
+            reconcile_status = "pending"
+            reconcile_message = str(exc)
 
     export_chronos_package(
         prediction_dir=prediction_dir,
@@ -800,6 +1001,9 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
 
     base_tickers = _parse_tickers(args.tickers, args.tickers_file)
     tickers = _resolve_v2_tickers(base_tickers, args.architecture, args.basket_mode)
+    if args.product_mode == "winner_picker" and args.architecture != "v2_flagship_basket_raw":
+        print("winner_picker is supported only with v2_flagship_basket_raw.")
+        return
     pipeline, context_length = _build_pipeline(args, tickers)
     forecaster_config = _build_forecaster_config(args, context_length)
     experiment_name = _build_experiment_name(args, context_length)
@@ -827,7 +1031,7 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
     ZeroShotResearchPipeline.write_result(experiment_dir, result)
 
     analysis_dir: Path | None = None
-    if args.architecture == "v2_flagship_basket_raw" and not args.skip_analysis:
+    if args.architecture == "v2_flagship_basket_raw" and args.product_mode == "ranker" and not args.skip_analysis:
         analysis_dir = output_dir / f"{experiment_name}_analysis"
         pipeline.analyze_signal_run(
             run_dir=output_dir,
@@ -896,6 +1100,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cross-learning", action="store_true")
     parser.add_argument("--no-covariates", action="store_true")
     parser.add_argument(
+        "--product-mode",
+        default=DEFAULT_PRODUCT_MODE,
+        choices=("ranker", "winner_picker"),
+    )
+    parser.add_argument(
+        "--confirmation-mode",
+        default=DEFAULT_WINNER_CONFIRMATION_MODE,
+        choices=DEFAULT_WINNER_CONFIRMATION_MODES,
+    )
+    parser.add_argument(
         "--architecture",
         default="v2_flagship_basket_raw",
         choices=("v1_residual", "v2_flagship_basket_raw"),
@@ -908,7 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--beta-mode",
         default=DEFAULT_V2_BETA_MODE,
-        choices=("unit_beta_1.0", "pooled_beta_140"),
+        choices=("unit_beta_1.0", "pooled_beta_140", "rolling_session_beta_20d"),
     )
     parser.add_argument(
         "--book-mode",

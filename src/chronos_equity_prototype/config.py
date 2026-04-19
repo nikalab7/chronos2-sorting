@@ -27,10 +27,13 @@ DEFAULT_LIQUID_SP500 = (
 
 DEFAULT_MODEL_ID = "amazon/chronos-2"
 DEFAULT_PREDICTION_LENGTH = 7
+DEFAULT_WINNER_PREDICTION_LENGTH = 21
 DEFAULT_CONTEXT_LENGTH = 256
 DEFAULT_V2_CONTEXT_LENGTH = 224
 DEFAULT_CONTEXT_ABLATIONS = (224, 256)
+DEFAULT_WINNER_CONTEXT_ABLATIONS = (128, 224, 512)
 DEFAULT_QUANTILES = (0.1, 0.5, 0.9)
+DEFAULT_WINNER_QUANTILES = (0.05, 0.1, 0.5, 0.9, 0.95)
 DEFAULT_CROSS_LEARNING_ABLATIONS = (False, True)
 DEFAULT_USE_COVARIATE_ABLATIONS = (True, False)
 DEFAULT_COSTS_BPS = (10, 20, 40)
@@ -41,6 +44,11 @@ DEFAULT_V2_BETA_MODE = "unit_beta_1.0"
 DEFAULT_V2_BOOK_MODE = "tail_fraction"
 DEFAULT_V2_TAIL_FRACTION = 0.10
 DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS = 30.0
+DEFAULT_PRODUCT_MODE = "ranker"
+DEFAULT_WINNER_CONFIRMATION_MODE = "1d_plus_3d"
+DEFAULT_WINNER_CONFIRMATION_MODES = ("1d_only", "1d_plus_3d")
+DEFAULT_WINNER_MAX_PICKS_FRACTION = 0.10
+DEFAULT_WINNER_MIN_PROMOTABLE_DAYS = 10
 
 
 @dataclass(frozen=True)
@@ -53,18 +61,23 @@ class ForecasterConfig:
     use_covariates: bool = True
     batch_size: int = DEFAULT_BATCH_SIZE
     beta_mode: str = DEFAULT_V2_BETA_MODE
+    product_mode: str = DEFAULT_PRODUCT_MODE
+    confirmation_mode: str = DEFAULT_WINNER_CONFIRMATION_MODE
 
 
 @dataclass(frozen=True)
 class ResearchConfig:
     model_id: str = DEFAULT_MODEL_ID
     prediction_length: int = DEFAULT_PREDICTION_LENGTH
+    winner_prediction_length: int = DEFAULT_WINNER_PREDICTION_LENGTH
     default_context_length: int = DEFAULT_CONTEXT_LENGTH
     default_v2_context_length: int = DEFAULT_V2_CONTEXT_LENGTH
     candidate_context_lengths: tuple[int, ...] = DEFAULT_CONTEXT_ABLATIONS
+    candidate_winner_context_lengths: tuple[int, ...] = DEFAULT_WINNER_CONTEXT_ABLATIONS
     candidate_cross_learning: tuple[bool, ...] = DEFAULT_CROSS_LEARNING_ABLATIONS
     candidate_use_covariates: tuple[bool, ...] = DEFAULT_USE_COVARIATE_ABLATIONS
     quantiles: tuple[float, ...] = DEFAULT_QUANTILES
+    winner_quantiles: tuple[float, ...] = DEFAULT_WINNER_QUANTILES
     costs_bps: tuple[int, ...] = DEFAULT_COSTS_BPS
     benchmark_ticker: str = DEFAULT_BENCHMARK_TICKER
     market_timezone: str = DEFAULT_MARKET_TIMEZONE
@@ -77,14 +90,30 @@ class ResearchConfig:
     default_short_borrow_fee_annual_bps: float = DEFAULT_SHORT_BORROW_FEE_ANNUAL_BPS
     liquid_universe: tuple[str, ...] = field(default_factory=lambda: DEFAULT_LIQUID_SP500)
     realized_vol_window: int = 20
+    default_product_mode: str = DEFAULT_PRODUCT_MODE
+    default_winner_confirmation_mode: str = DEFAULT_WINNER_CONFIRMATION_MODE
+    candidate_winner_confirmation_modes: tuple[str, ...] = DEFAULT_WINNER_CONFIRMATION_MODES
+    default_winner_max_picks_fraction: float = DEFAULT_WINNER_MAX_PICKS_FRACTION
+    winner_min_promotable_days: int = DEFAULT_WINNER_MIN_PROMOTABLE_DAYS
 
-    def default_forecaster_config(self, *, use_covariates: bool = True, cross_learning: bool = False) -> ForecasterConfig:
+    def default_forecaster_config(
+        self,
+        *,
+        use_covariates: bool = True,
+        cross_learning: bool = False,
+        product_mode: str = DEFAULT_PRODUCT_MODE,
+        confirmation_mode: str = DEFAULT_WINNER_CONFIRMATION_MODE,
+    ) -> ForecasterConfig:
+        prediction_length = self.prediction_length if product_mode == "ranker" else self.winner_prediction_length
+        quantiles = self.quantiles if product_mode == "ranker" else self.winner_quantiles
         return ForecasterConfig(
             model_id=self.model_id,
-            prediction_length=self.prediction_length,
+            prediction_length=prediction_length,
             context_length=self.default_context_length,
-            quantiles=self.quantiles,
+            quantiles=quantiles,
             cross_learning=cross_learning,
             use_covariates=use_covariates,
             batch_size=self.batch_size,
+            product_mode=product_mode,
+            confirmation_mode=confirmation_mode,
         )
