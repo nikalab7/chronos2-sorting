@@ -1,0 +1,47 @@
+name: WDC Bolt representation test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/wdc_bolt_representation_test.py'
+      - '.github/workflows/wdc-bolt-representation-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install CPU PyTorch
+        run: python -m pip install --upgrade pip && python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install experiment dependencies
+        run: python -m pip install 'chronos-forecasting==2.3.1' 'yfinance>=0.2.54' pandas numpy
+
+      - name: Run WDC representation experiment
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          TOKENIZERS_PARALLELISM: 'false'
+        run: python experiments/wdc_bolt_representation_test.py | tee wdc_representation_test.log
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdc-bolt-representation-results
+          path: |
+            wdc_representation_results/
+            wdc_representation_test.log
+          if-no-files-found: warn
